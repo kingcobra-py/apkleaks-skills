@@ -16,6 +16,9 @@ dynamic = ["dependencies", "version"]
 [project.scripts]
 apkleaks = "apkleaks.cli:main"
 
+[tool.setuptools]
+script-files = ["apkleaks-ai-cli.py"]
+
 [project.urls]
 Homepage = "https://github.com/dwisiswant0/apkleaks/"
 

@@ -15,6 +15,10 @@ Scanning APK file for URIs, endpoints & secrets.
     - [Output](#output)
     - [Pattern](#pattern)
     - [Arguments (for disassembler)](#arguments-for-disassembler)
+- [AI Integration](#ai-integration)
+  - [AI-CLI Subcommands](#ai-cli-subcommands)
+  - [MCP Server (Claude Code)](#mcp-server-claude-code)
+  - [MCP Runtime Options](#mcp-runtime-options)
 - [License](#license)
 - [Acknowledments](#acknowledments)
 
@@ -113,6 +117,112 @@ $ apkleaks -f /path/to/file.apk -a "--deobf --log-level DEBUG"
 
 > [!WARNING]
 > Please pay attention to the default disassembler arguments we use to prevent collisions.
+
+## AI Integration
+
+APKLeaks includes `apkleaks-ai-cli.py` — a structured JSON interface designed for AI agents (Claude Code, GPT, etc.) with 10 subcommands and an MCP server mode.
+
+### AI-CLI Subcommands
+
+| Subcommand | Description | Example |
+|-----------|-------------|---------|
+| `schema` | Tool self-description (AI discovers all capabilities) | `python3 apkleaks-ai-cli.py schema` |
+| `version` | Show version info | `python3 apkleaks-ai-cli.py version` |
+| `check` | Verify prerequisites + APK validity | `python3 apkleaks-ai-cli.py check -f app.apk` |
+| `info` | Extract APK metadata (no decompile) | `python3 apkleaks-ai-cli.py info -f app.apk` |
+| `scan` | Full scan: decompile + regex + severity | `python3 apkleaks-ai-cli.py scan -f app.apk` |
+| `patterns` | List regex patterns with severity | `python3 apkleaks-ai-cli.py patterns -v` |
+| `decompile` | Decompile APK to Java source | `python3 apkleaks-ai-cli.py decompile -f app.apk` |
+| `search` | Search decompiled source with regex | `python3 apkleaks-ai-cli.py search -d /tmp/src -p "password"` |
+| `explain` | Explain a finding category | `python3 apkleaks-ai-cli.py explain -c Amazon_AWS_Access_Key_ID` |
+| `mcp` | Run as MCP server over stdio | `python3 apkleaks-ai-cli.py mcp` |
+
+All subcommands return structured JSON:
+
+```json
+{"ok": true, "timestamp": "...", "duration_ms": 123, "data": {...}}
+{"ok": false, "timestamp": "...", "error": "...", "error_code": "FILE_NOT_FOUND"}
+```
+
+### MCP Server (Claude Code)
+
+The MCP server lets AI tools (like Claude Code) call APKLeaks directly without Bash subprocesses. It implements the [Model Context Protocol](https://modelcontextprotocol.io/) over stdio:
+
+1. **Lifecycle:** `initialize` → `notifications/initialized` → ready
+2. **Discovery:** `tools/list` returns 9 tool definitions with rich JSON Schema (descriptions, enums, defaults)
+3. **Invocation:** `tools/call` dispatches `apkleaks_*` tool names to internal `cmd_*` functions
+4. **Keep-alive:** `ping` responds immediately
+
+The MCP server uses **lazy imports** — lifecycle methods (`initialize`, `ping`, `tools/list`) work without `pyaxmlparser` installed. Only actual scan/info/decompile calls require dependencies.
+
+#### MCP Tools
+
+| Tool Name | Description | Key Parameters |
+|-----------|-------------|----------------|
+| `apkleaks_schema` | Discover all capabilities | — |
+| `apkleaks_version` | Version info | — |
+| `apkleaks_check` | Verify prerequisites + APK validity | `file` |
+| `apkleaks_info` | APK metadata (no decompile) | `file` |
+| `apkleaks_scan` | Full scan with severity classification | `file`, `severity` (critical/high/medium/low/info), `pattern`, `jadx_args`, `output`, `json_output` |
+| `apkleaks_patterns` | List regex detection patterns | `verbose` |
+| `apkleaks_decompile` | Decompile to Java source | `file`, `output_dir`, `jadx_args` |
+| `apkleaks_search` | Search decompiled source | `dir`, `pattern`, `type` (java/xml/json/smali/all), `context`, `limit` |
+| `apkleaks_explain` | Explain a finding category | `category` |
+
+### MCP Runtime Options
+
+Choose a runtime based on your environment. All three are fully supported:
+
+#### Option 1: `uv run` (Recommended)
+
+Auto-installs dependencies into an isolated venv. No manual `pip install` needed.
+
+```json
+{
+  "mcpServers": {
+    "apkleaks": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python3", "apkleaks-ai-cli.py", "mcp"]
+    }
+  }
+}
+```
+
+Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+#### Option 2: `pipx run`
+
+Similar to `uv run` — creates a temporary venv and installs deps. Good for non-uv users.
+
+```json
+{
+  "mcpServers": {
+    "apkleaks": {
+      "command": "pipx",
+      "args": ["run", "--directory", ".", "python3", "apkleaks-ai-cli.py", "mcp"]
+    }
+  }
+}
+```
+
+Install pipx: `pip install pipx` or `brew install pipx`
+
+#### Option 3: `python3` (Manual)
+
+Direct execution. Requires `pip install -e .` or `pip install -r requirements.txt` first.
+
+```json
+{
+  "mcpServers": {
+    "apkleaks": {
+      "command": "python3",
+      "args": ["apkleaks-ai-cli.py", "mcp"]
+    }
+  }
+}
+```
+
+Add the config to your project's `.claude/settings.json` and Claude Code will automatically start the MCP server when you open the project.
 
 ## License
 

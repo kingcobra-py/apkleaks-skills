@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "apkleaks": {
+      "command": "uv",
+      "args": ["run", "--directory", ".", "python3", "apkleaks-ai-cli.py", "mcp"]
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 apkleaks-ai-cli.py*)",
+      "Bash(uv run*)",
+      "Bash(python3 apkleaks.py*)",
+      "Bash(rm -rf /tmp/apkleaks*)"
+    ]
+  }
+}
