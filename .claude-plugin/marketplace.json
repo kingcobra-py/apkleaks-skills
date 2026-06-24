@@ -1,0 +1,16 @@
+{
+  "name": "apkleaks-skills",
+  "version": "2.6.3",
+  "description": "AI-agent-native APK security tooling: the apkleaks scanner plus reverse-engineering skills, distributed as an installable Claude Code plugin.",
+  "owner": {
+    "name": "android-security-engineer",
+    "url": "https://github.com/android-security-engineer"
+  },
+  "plugins": [
+    {
+      "name": "apkleaks",
+      "source": "./",
+      "description": "Scan Android APKs for secrets, API keys, tokens and endpoints (95+ patterns across 12 categories), with a bundled MCP server and 9 rev-* reverse-engineering skills."
+    }
+  ]
+}

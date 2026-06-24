@@ -1,0 +1,34 @@
+{
+  "name": "apkleaks",
+  "version": "2.6.3",
+  "description": "AI-agent-native APK security scanner — find secrets, API keys, tokens and endpoints in Android APKs, plus 9 reverse-engineering skills. Bundles an MCP server (12 tools, 4 resources, 4 prompts) and a structured-JSON CLI.",
+  "author": {
+    "name": "android-security-engineer",
+    "url": "https://github.com/android-security-engineer"
+  },
+  "homepage": "https://github.com/android-security-engineer/apkleaks-skills",
+  "repository": "https://github.com/android-security-engineer/apkleaks-skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "android",
+    "apk",
+    "security",
+    "reverse-engineering",
+    "secret-scanning",
+    "mcp",
+    "skills"
+  ],
+  "mcpServers": {
+    "apkleaks": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "python3",
+        "apkleaks-ai-cli.py",
+        "mcp"
+      ]
+    }
+  }
+}
