@@ -14,40 +14,41 @@
 
 ### 功能树一览
 
-在上游 APKLeaks 基础上二次开发、重新打造为 AI 原生工具集。一图抵千言——全部接入方式、能力与 skill 尽收一图（由 GitHub 实时渲染）：
+在上游 APKLeaks 基础上二次开发、重新打造为 AI 原生工具集。一图抵千言——全部接入方式、能力与 skill 尽收一图。下图由 [`tools/feature_tree.py`](tools/feature_tree.py) 渲染（纯标准库，不依赖 Mermaid/Graphviz），并以普通 SVG 提交进仓库，因此在任意 Markdown 查看器里都能显示：
 
-```mermaid
-mindmap
-  root((APKLeaks for AI Agents))
-    Built on upstream
-      Fork of dwisiswant0/apkleaks
-      Scanning engine unchanged
-      Adds an AI-native layer on top
-    Agent access surfaces
-      MCP server
-        12 tools
-        4 resources
-        4 prompts
-      Structured-JSON CLI
-        13 subcommands
-        Deterministic JSON envelope
-      Claude Code skills
-        9 rev-skills
-        One-step plugin install
-    Core capabilities
-      check and info
-      scan severity-graded
-      decompile and search
-      explain impact and fix
-      rule add test remove
-    Detection coverage
-      95+ patterns
-      12 categories
-    Agent contract
-      ok flag and error_code
-      schema self-discovery
-      has_critical triage
+![APKLeaks for AI Agents — 功能树](docs/feature-tree.svg)
+
+<details>
+<summary>文本版（任何环境都能显示）</summary>
+
+```text
+APKLeaks for AI Agents
+├─ Built on upstream
+│  ├─ Fork of dwisiswant0/apkleaks
+│  ├─ Scanning engine unchanged
+│  └─ AI-native layer added on top
+├─ Agent access surfaces
+│  ├─ MCP server — 12 tools / 4 resources / 4 prompts
+│  ├─ Structured-JSON CLI — 13 subcommands
+│  └─ Claude Code skills — 9 rev-* skills
+├─ Core capabilities
+│  ├─ check / info
+│  ├─ scan — severity-graded
+│  ├─ decompile / search
+│  ├─ explain — impact + fix
+│  └─ rule add / test / remove
+├─ Detection coverage
+│  ├─ 95+ patterns
+│  └─ 12 categories
+└─ Agent contract
+   ├─ ok flag + stable error_code
+   ├─ schema self-discovery
+   └─ has_critical triage
 ```
+
+用 `python3 tools/feature_tree.py` 可重新生成（写出 `docs/feature-tree.svg` 并打印此树）。
+
+</details>
 
 ### 目录
 

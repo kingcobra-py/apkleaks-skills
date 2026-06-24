@@ -14,40 +14,41 @@ It ships in one repository as three things at once: an **MCP server**, a **struc
 
 ### Feature tree at a glance
 
-A fork of upstream APKLeaks, re-architected as an AI-native toolkit. One picture over a thousand words — every access surface, capability, and skill in a single view (rendered live by GitHub):
+A fork of upstream APKLeaks, re-architected as an AI-native toolkit. One picture over a thousand words — every access surface, capability, and skill in a single view. The figure below is rendered by [`tools/feature_tree.py`](tools/feature_tree.py) (pure standard library, no Mermaid/Graphviz) and committed as a plain SVG, so it shows up in any Markdown viewer:
 
-```mermaid
-mindmap
-  root((APKLeaks for AI Agents))
-    Built on upstream
-      Fork of dwisiswant0/apkleaks
-      Scanning engine unchanged
-      Adds an AI-native layer on top
-    Agent access surfaces
-      MCP server
-        12 tools
-        4 resources
-        4 prompts
-      Structured-JSON CLI
-        13 subcommands
-        Deterministic JSON envelope
-      Claude Code skills
-        9 rev-skills
-        One-step plugin install
-    Core capabilities
-      check and info
-      scan severity-graded
-      decompile and search
-      explain impact and fix
-      rule add test remove
-    Detection coverage
-      95+ patterns
-      12 categories
-    Agent contract
-      ok flag and error_code
-      schema self-discovery
-      has_critical triage
+![APKLeaks for AI Agents — feature tree](docs/feature-tree.svg)
+
+<details>
+<summary>Text version (always renders)</summary>
+
+```text
+APKLeaks for AI Agents
+├─ Built on upstream
+│  ├─ Fork of dwisiswant0/apkleaks
+│  ├─ Scanning engine unchanged
+│  └─ AI-native layer added on top
+├─ Agent access surfaces
+│  ├─ MCP server — 12 tools / 4 resources / 4 prompts
+│  ├─ Structured-JSON CLI — 13 subcommands
+│  └─ Claude Code skills — 9 rev-* skills
+├─ Core capabilities
+│  ├─ check / info
+│  ├─ scan — severity-graded
+│  ├─ decompile / search
+│  ├─ explain — impact + fix
+│  └─ rule add / test / remove
+├─ Detection coverage
+│  ├─ 95+ patterns
+│  └─ 12 categories
+└─ Agent contract
+   ├─ ok flag + stable error_code
+   ├─ schema self-discovery
+   └─ has_critical triage
 ```
+
+Regenerate with `python3 tools/feature_tree.py` (writes `docs/feature-tree.svg` and prints this tree).
+
+</details>
 
 ### Contents
 
