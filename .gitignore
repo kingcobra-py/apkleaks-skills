@@ -4,3 +4,6 @@ jadx/
 build/
 dist/
 venv/
+__pycache__/
+website/dist/
+website/node_modules/
