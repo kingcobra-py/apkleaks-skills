@@ -1,151 +1,156 @@
 import React from 'react';
-import { Typography, Row, Col, Card, Steps, Tabs, Tag } from 'antd';
+import { Typography, Row, Col, Card, Steps, Tabs, Tag, Button } from 'antd';
 import {
   CloudDownloadOutlined,
   SettingOutlined,
   CheckCircleOutlined,
+  CopyOutlined,
 } from '@ant-design/icons';
+import { useTranslation } from 'react-i18next';
+import { motion } from 'framer-motion';
 
 const { Title, Paragraph, Text } = Typography;
 
-const codeStyle: React.CSSProperties = {
-  background: '#0f172a',
-  color: '#e2e8f0',
-  padding: '16px 20px',
-  borderRadius: 8,
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-  fontSize: '0.85rem',
-  lineHeight: 1.6,
-  overflowX: 'auto',
-  whiteSpace: 'pre',
+const CodeBlock: React.FC<{ children: string }> = ({ children }) => {
+  const [copied, setCopied] = React.useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(children);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <pre className="code-block">{children}</pre>
+      <Button
+        type="text"
+        size="small"
+        icon={<CopyOutlined />}
+        onClick={handleCopy}
+        style={{ position: 'absolute', top: 8, right: 8, color: '#64748b' }}
+      >
+        {copied ? '✓' : ''}
+      </Button>
+    </div>
+  );
 };
 
-const InstallPage: React.FC = () => (
-  <section className="section">
-    <Title level={2} style={{ textAlign: 'center', marginBottom: 8 }}>
-      Install — Plug It Into Your Agent
-    </Title>
-    <Paragraph style={{ textAlign: 'center', color: '#64748b', marginBottom: 48 }}>
-      Not "install then run manually" — this wires the tool into your agent&apos;s runtime.
-    </Paragraph>
+const InstallPage: React.FC = () => {
+  const { t } = useTranslation();
 
-    {/* Prerequisites */}
-    <Card style={{ marginBottom: 40 }}>
-      <Title level={4}>Prerequisites</Title>
-      <Row gutter={[16, 12]}>
-        <Col xs={24} sm={12}>
-          <Tag color="blue">Python ≥ 3.8</Tag>
-        </Col>
-        <Col xs={24} sm={12}>
-          <Tag color="blue">jadx v1.2.0</Tag> <Text type="secondary">(auto-downloaded on first decompile)</Text>
-        </Col>
-        <Col xs={24} sm={12}>
-          <Tag color="blue">pyaxmlparser ≥ 0.24</Tag> <Text type="secondary">(scan/info/decompile only)</Text>
-        </Col>
-        <Col xs={24} sm={12}>
-          <Tag color="blue">uv</Tag> <Text type="secondary">(MCP server auto-installs deps)</Text>
-        </Col>
-      </Row>
-    </Card>
-
-    {/* Recommended: Plugin install */}
-    <Title level={3}>Recommended: Claude Code Plugin</Title>
-    <Paragraph type="secondary" style={{ marginBottom: 24 }}>
-      One step registers all 9 skills + the MCP server. No manual settings.json editing.
-    </Paragraph>
-    <Steps
-      direction="vertical"
-      size="small"
-      current={-1}
-      items={[
-        {
-          title: 'Add from marketplace',
-          icon: <CloudDownloadOutlined />,
-          description: (
-            <div style={codeStyle}>/plugin marketplace add android-security-engineer/apkleaks-skills</div>
-          ),
-        },
-        {
-          title: 'Install the plugin',
-          icon: <SettingOutlined />,
-          description: <div style={codeStyle}>/plugin install apkleaks</div>,
-        },
-        {
-          title: 'Done — use it',
-          icon: <CheckCircleOutlined />,
-          description: (
-            <div>
-              <div style={codeStyle}>{'/rev-apkleaks scan app.apk\n# or via MCP tool:\napkleaks_scan({ "file": "app.apk" })'}</div>
-            </div>
-          ),
-        },
-      ]}
-    />
-
-    {/* Manual MCP wiring */}
-    <Title level={3} style={{ marginTop: 48 }}>Alternative: Manual MCP Server</Title>
-    <Paragraph type="secondary" style={{ marginBottom: 24 }}>
-      For local development on this repo, or non-plugin runtimes.
-    </Paragraph>
-    <Tabs
-      items={[
-        {
-          key: 'uv',
-          label: 'uv run (recommended)',
-          children: (
-            <div style={codeStyle}>{`{
+  const tabItems = [
+    {
+      key: 'uv',
+      label: t('install.manual.uv'),
+      children: (
+        <CodeBlock>{`{
   "mcpServers": {
     "apkleaks": {
       "command": "uv",
       "args": ["run", "--directory", ".", "python3", "apkleaks-ai-cli.py", "mcp"]
     }
   }
-}`}</div>
-          ),
-        },
-        {
-          key: 'pipx',
-          label: 'pipx run',
-          children: (
-            <div style={codeStyle}>{`{
+}`}</CodeBlock>
+      ),
+    },
+    {
+      key: 'pipx',
+      label: t('install.manual.pipx'),
+      children: (
+        <CodeBlock>{`{
   "mcpServers": {
     "apkleaks": {
       "command": "pipx",
       "args": ["run", "--directory", ".", "python3", "apkleaks-ai-cli.py", "mcp"]
     }
   }
-}`}</div>
-          ),
-        },
-        {
-          key: 'python3',
-          label: 'python3 (manual)',
-          children: (
-            <>
-              <Paragraph type="secondary">Requires <Text code>pip install -e .</Text> first.</Paragraph>
-              <div style={codeStyle}>{`{
+}`}</CodeBlock>
+      ),
+    },
+    {
+      key: 'python',
+      label: t('install.manual.python'),
+      children: (
+        <>
+          <Paragraph type="secondary">{t('install.manual.pythonNote')}</Paragraph>
+          <CodeBlock>{`{
   "mcpServers": {
     "apkleaks": {
       "command": "python3",
       "args": ["apkleaks-ai-cli.py", "mcp"]
     }
   }
-}`}</div>
-            </>
-          ),
-        },
-      ]}
-    />
+}`}</CodeBlock>
+        </>
+      ),
+    },
+  ];
 
-    {/* CLI-only */}
-    <Title level={3} style={{ marginTop: 48 }}>CLI Only — No Setup Required</Title>
-    <Paragraph type="secondary">
-      For any agent with Bash access, just run the CLI directly. Zero config.
-    </Paragraph>
-    <div style={codeStyle}>{`python3 apkleaks-ai-cli.py schema                       # discover all capabilities
+  return (
+    <section className="section">
+      <Title level={2} style={{ textAlign: 'center', marginBottom: 8 }}>
+        {t('install.title')}
+      </Title>
+      <Paragraph style={{ textAlign: 'center', color: '#64748b', marginBottom: 48, maxWidth: 640, margin: '0 auto 48px' }}>
+        {t('install.subtitle')}
+      </Paragraph>
+
+      {/* Prerequisites */}
+      <motion.div initial={{ opacity: 0, y: 16 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true }}>
+        <Card className="glass-card" style={{ marginBottom: 40 }}>
+          <Title level={4}>{t('install.prereq')}</Title>
+          <Row gutter={[12, 12]}>
+            <Col><Tag color="blue">Python ≥ 3.8</Tag></Col>
+            <Col><Tag color="blue">jadx v1.2.0</Tag> <Text type="secondary">(auto-downloaded)</Text></Col>
+            <Col><Tag color="blue">pyaxmlparser ≥ 0.24</Tag> <Text type="secondary">(scan/info only)</Text></Col>
+            <Col><Tag color="blue">uv</Tag> <Text type="secondary">(MCP deps)</Text></Col>
+          </Row>
+        </Card>
+      </motion.div>
+
+      {/* Plugin install */}
+      <Title level={3}>{t('install.plugin.title')}</Title>
+      <Paragraph type="secondary" style={{ marginBottom: 24 }}>
+        {t('install.plugin.subtitle')}
+      </Paragraph>
+      <Steps
+        direction="vertical"
+        size="small"
+        current={-1}
+        items={[
+          {
+            title: t('install.plugin.step1'),
+            icon: <CloudDownloadOutlined />,
+            description: <CodeBlock>{'/plugin marketplace add android-security-engineer/apkleaks-skills'}</CodeBlock>,
+          },
+          {
+            title: t('install.plugin.step2'),
+            icon: <SettingOutlined />,
+            description: <CodeBlock>{'/plugin install apkleaks'}</CodeBlock>,
+          },
+          {
+            title: t('install.plugin.step3'),
+            icon: <CheckCircleOutlined />,
+            description: <CodeBlock>{'/rev-apkleaks scan app.apk\napkleaks_scan({ "file": "app.apk" })'}</CodeBlock>,
+          },
+        ]}
+      />
+
+      {/* Manual MCP */}
+      <Title level={3} style={{ marginTop: 56 }}>{t('install.manual.title')}</Title>
+      <Paragraph type="secondary" style={{ marginBottom: 16 }}>
+        {t('install.manual.subtitle')}
+      </Paragraph>
+      <Tabs items={tabItems} />
+
+      {/* CLI only */}
+      <Title level={3} style={{ marginTop: 56 }}>{t('install.cli.title')}</Title>
+      <Paragraph type="secondary">{t('install.cli.subtitle')}</Paragraph>
+      <CodeBlock>{`python3 apkleaks-ai-cli.py schema                       # discover all capabilities
 python3 apkleaks-ai-cli.py scan -f app.apk -s critical  # triage critical findings only
-python3 apkleaks-ai-cli.py explain -c AWS_API_Key       # impact + remediation per category`}</div>
-  </section>
-);
+python3 apkleaks-ai-cli.py explain -c AWS_API_Key       # impact + remediation per category`}</CodeBlock>
+    </section>
+  );
+};
 
 export default InstallPage;

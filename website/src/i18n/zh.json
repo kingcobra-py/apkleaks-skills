@@ -1,0 +1,112 @@
+{
+  "hero": {
+    "title": "APKLeaks for AI Agents",
+    "subtitle": "在 Android APK 中查找密钥、API key、令牌与接口端点——重新打造为 AI 原生工具。每个接口都讲 JSON、一次调用即可自我描述、自带严重性分级。",
+    "installBtn": "安装插件",
+    "exploreBtn": "探索功能"
+  },
+  "nav": {
+    "home": "首页",
+    "features": "功能",
+    "skills": "Skills",
+    "install": "安装",
+    "lang": "EN"
+  },
+  "home": {
+    "whyTitle": "为什么要做这个二开？",
+    "whySubtitle": "上游的 APKLeaks 是一个不错的人类 CLI——但当操作者是一个 LLM 时，这套契约就崩了。这个二开版本在同一个引擎之上包了一层 AI 原生的壳。",
+    "engine": {
+      "title": "基于成熟引擎",
+      "desc": "Fork of dwisiswant0/apkleaks——扫描逻辑未改，在原引擎之上添加了 AI 原生层。"
+    },
+    "mcp": {
+      "title": "MCP 服务器",
+      "desc": "12 工具、4 资源、4 提示词——通过 Model Context Protocol 原生工具调用，无需 Bash 子进程。"
+    },
+    "cli": {
+      "title": "结构化 JSON CLI",
+      "desc": "13 个子命令、确定性 JSON 外壳——任何能执行 shell 的 Agent 都可用。"
+    },
+    "skills": {
+      "title": "9 个逆向 Skill",
+      "desc": "插件安装后自动发现、按意图触发、彼此顺畅串联。"
+    },
+    "loopTitle": "一个典型的 Agent 循环",
+    "loopNote": "每一步都返回 ok + 稳定的 error_code——Agent 永远无需解析自然语言来决定下一步做什么。",
+    "ctaTitle": "准备好了吗？",
+    "ctaDesc": "安装插件，一分钟内扫描你的第一个 APK。",
+    "ctaLink": "→ 安装指南"
+  },
+  "features": {
+    "title": "功能树一览",
+    "subtitle": "在上游 APKLeaks 基础上二次开发、重新打造为 AI 原生工具集。由 tools/feature_tree.py 渲染（纯标准库）。",
+    "detection": {
+      "title": "检测覆盖范围",
+      "patterns": "正则规则",
+      "categories": "类别",
+      "mcpTools": "MCP 工具",
+      "cliSubs": "CLI 子命令"
+    },
+    "contract": {
+      "title": "Agent 契约",
+      "subtitle": "每个响应都遵循同一种可预测的结构——确定性、机器可读，无需解析自然语言。",
+      "ok": {
+        "title": "ok 标志 + 稳定 error_code",
+        "desc": "用于分支判断的单一布尔值；稳定的机器可匹配错误码（FILE_NOT_FOUND、INVALID_APK、NO_FINDINGS…）"
+      },
+      "schema": {
+        "title": "schema 自发现",
+        "desc": "一次调用即可返回全部子命令、参数与返回结构——Agent 无需读源码就能学到整套 API"
+      },
+      "critical": {
+        "title": "has_critical 分诊",
+        "desc": "发现项已预先分级 critical→info；has_critical 标志一步分诊；可用 -s critical 过滤"
+      }
+    },
+    "envelope": {
+      "title": "响应外壳",
+      "subtitle": "每个子命令和工具都返回下列之一：",
+      "success": "成功",
+      "error": "错误"
+    }
+  },
+  "skills": {
+    "title": "9 个逆向工程 Skill",
+    "subtitle": "插件安装后自动发现。按意图触发、彼此串联。每个采用渐进式披露：精简 SKILL.md 触发时加载，深度 reference.md 按需读取。",
+    "anatomy": {
+      "title": "渐进式披露结构",
+      "subtitle": "每个 skill 都遵循规范的 anthropics/skills 结构：",
+      "skill": "SKILL.md — 精简入口，触发时加载：概览、核心工作流、硬性规则。",
+      "ref": "references/reference.md — 深度参考，按需读取：完整目录、错误码、边界情况。",
+      "license": "LICENSE.txt — Apache-2.0，镜像根 LICENSE。"
+    }
+  },
+  "install": {
+    "title": "安装——接入你的 Agent",
+    "subtitle": "不是'装好后手动扫描'——是把工具接入 Agent 的运行时。",
+    "prereq": "前置条件",
+    "plugin": {
+      "title": "推荐：作为 Claude Code 插件安装",
+      "subtitle": "一步注册全部 9 个 skill + MCP 服务器，无需手动编辑 settings.json。",
+      "step1": "从 marketplace 添加",
+      "step2": "安装插件",
+      "step3": "完成——直接用"
+    },
+    "manual": {
+      "title": "备选：手动接入 MCP 服务器",
+      "subtitle": "适用于本仓库本地开发，或不支持插件的运行时。",
+      "uv": "uv run（推荐）",
+      "pipx": "pipx run",
+      "python": "python3（手动）",
+      "pythonNote": "需先 pip install -e .。"
+    },
+    "cli": {
+      "title": "纯 CLI——无需配置",
+      "subtitle": "任何有 Bash 权限的 Agent 直接运行即可。零配置。"
+    }
+  },
+  "footer": {
+    "built": "构建于",
+    "copyright": "© year android-security-engineer"
+  }
+}

@@ -1,0 +1,112 @@
+{
+  "hero": {
+    "title": "APKLeaks for AI Agents",
+    "subtitle": "Find secrets, API keys, tokens and endpoints in Android APKs — re-architected for AI agents. Every surface speaks JSON, self-describes in one call, and grades its own findings.",
+    "installBtn": "Install Plugin",
+    "exploreBtn": "Explore Features"
+  },
+  "nav": {
+    "home": "Home",
+    "features": "Features",
+    "skills": "Skills",
+    "install": "Install",
+    "lang": "中文"
+  },
+  "home": {
+    "whyTitle": "Why This Fork?",
+    "whySubtitle": "Upstream APKLeaks is a solid human CLI — but when the operator is an LLM, the contract breaks. This fork wraps the same engine with an AI-native layer.",
+    "engine": {
+      "title": "Built on Proven Engine",
+      "desc": "Fork of dwisiswant0/apkleaks — scanning engine unchanged, adds an AI-native layer on top."
+    },
+    "mcp": {
+      "title": "MCP Server",
+      "desc": "12 tools, 4 resources, 4 prompts — native tool calls via Model Context Protocol, no Bash subprocess."
+    },
+    "cli": {
+      "title": "Structured-JSON CLI",
+      "desc": "13 subcommands with deterministic JSON envelope — works from any shell-capable agent."
+    },
+    "skills": {
+      "title": "9 Rev-Skills",
+      "desc": "Auto-discovered on plugin install. Triggered by intent, chain seamlessly."
+    },
+    "loopTitle": "A Typical Agent Loop",
+    "loopNote": "Every step returns ok + a stable error_code — the agent never parses natural language to decide what to do next.",
+    "ctaTitle": "Ready to get started?",
+    "ctaDesc": "Install the plugin and scan your first APK in under a minute.",
+    "ctaLink": "→ Installation Guide"
+  },
+  "features": {
+    "title": "Feature Tree at a Glance",
+    "subtitle": "A fork of upstream APKLeaks, re-architected as an AI-native toolkit. Rendered by tools/feature_tree.py (pure stdlib).",
+    "detection": {
+      "title": "Detection Coverage",
+      "patterns": "Regex Patterns",
+      "categories": "Categories",
+      "mcpTools": "MCP Tools",
+      "cliSubs": "CLI Subcommands"
+    },
+    "contract": {
+      "title": "Agent Contract",
+      "subtitle": "Every response follows the same predictable structure — deterministic, machine-readable, no prose parsing needed.",
+      "ok": {
+        "title": "ok flag + stable error_code",
+        "desc": "Single boolean for branching; stable machine-matchable codes (FILE_NOT_FOUND, INVALID_APK, NO_FINDINGS…)"
+      },
+      "schema": {
+        "title": "schema self-discovery",
+        "desc": "One call returns all subcommands, parameters & return structures — agent learns the full API without reading source"
+      },
+      "critical": {
+        "title": "has_critical triage",
+        "desc": "Findings pre-sorted critical→info; flag for one-branch triage; filter with -s critical / severity parameter"
+      }
+    },
+    "envelope": {
+      "title": "Response Envelope",
+      "subtitle": "Every subcommand and tool returns one of:",
+      "success": "Success",
+      "error": "Error"
+    }
+  },
+  "skills": {
+    "title": "9 Reverse-Engineering Skills",
+    "subtitle": "Auto-discovered on plugin install. Triggered by intent, chain seamlessly. Each follows progressive-disclosure: lean SKILL.md on trigger, deep reference.md on demand.",
+    "anatomy": {
+      "title": "Progressive-Disclosure Anatomy",
+      "subtitle": "Every skill follows the canonical anthropics/skills anatomy:",
+      "skill": "SKILL.md — lean entry loaded on trigger: overview, execution flow, hard rules.",
+      "ref": "references/reference.md — deep docs read on demand: full catalogs, error codes, edge cases.",
+      "license": "LICENSE.txt — Apache-2.0, mirrors root LICENSE per spec."
+    }
+  },
+  "install": {
+    "title": "Install — Plug It Into Your Agent",
+    "subtitle": "Not \"install then run manually\" — this wires the tool into your agent's runtime.",
+    "prereq": "Prerequisites",
+    "plugin": {
+      "title": "Recommended: Claude Code Plugin",
+      "subtitle": "One step registers all 9 skills + the MCP server. No manual settings.json editing.",
+      "step1": "Add from marketplace",
+      "step2": "Install the plugin",
+      "step3": "Done — use it"
+    },
+    "manual": {
+      "title": "Alternative: Manual MCP Server",
+      "subtitle": "For local development on this repo, or non-plugin runtimes.",
+      "uv": "uv run (recommended)",
+      "pipx": "pipx run",
+      "python": "python3 (manual)",
+      "pythonNote": "Requires pip install -e . first."
+    },
+    "cli": {
+      "title": "CLI Only — No Setup Required",
+      "subtitle": "For any agent with Bash access, just run the CLI directly. Zero config."
+    }
+  },
+  "footer": {
+    "built": "Built on",
+    "copyright": "© year android-security-engineer"
+  }
+}

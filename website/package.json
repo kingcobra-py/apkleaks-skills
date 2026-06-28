@@ -10,10 +10,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ant-design/charts": "^2.6.7",
     "@ant-design/icons": "^6.3.2",
     "antd": "^6.5.0",
+    "framer-motion": "^12.42.0",
+    "i18next": "^26.3.3",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
+    "react-i18next": "^17.0.8",
     "react-router-dom": "^7.18.0"
   },
   "devDependencies": {
