@@ -23,6 +23,7 @@ Subcommands:
 """
 
 import argparse
+import builtins
 import json
 import os
 import sys
@@ -610,8 +611,10 @@ def cmd_scan(args):
     old_stderr = sys.stderr
     sys.stdout = io.StringIO()
     sys.stderr = io.StringIO()
-    original_input = getattr(__builtins__, "input", None)
-    __builtins__.input = lambda _: "Y"
+    # Use builtins module (not __builtins__) so importlib-loaded CLI works:
+    # under importlib, __builtins__ is a dict and attribute assignment fails.
+    original_input = builtins.input
+    builtins.input = lambda _: "Y"
 
     runner = None
     try:
@@ -668,8 +671,7 @@ def cmd_scan(args):
     finally:
         sys.stdout = old_stdout
         sys.stderr = old_stderr
-        if original_input is not None:
-            __builtins__.input = original_input
+        builtins.input = original_input
         if runner and hasattr(runner, "fileout"):
             try:
                 runner.fileout.close()
