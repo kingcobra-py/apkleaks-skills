@@ -80,6 +80,46 @@ class StatusHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def _content_type(self, path: Path) -> str:
+        if path.suffix == ".js":
+            return "application/javascript"
+        if path.suffix == ".css":
+            return "text/css"
+        if path.suffix == ".json":
+            return "application/json"
+        if path.suffix == ".html":
+            return "text/html; charset=utf-8"
+        if path.suffix in (".png", ".jpg", ".jpeg", ".webp", ".svg"):
+            return f"image/{path.suffix.lstrip('.').replace('svg', 'svg+xml')}"
+        if path.suffix == ".ico":
+            return "image/x-icon"
+        return "application/octet-stream"
+
+    def _serve_file(self, candidate: Path) -> bool:
+        dist_root = self.website_dist.resolve()
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        if not str(resolved).startswith(str(dist_root)) or not resolved.is_file():
+            return False
+        self._send(200, resolved.read_bytes(), self._content_type(resolved))
+        return True
+
+    def _serve_spa(self, rel_path: str) -> bool:
+        """Serve a static file from website/dist, with SPA fallback to index.html."""
+        if not self.website_dist.is_dir():
+            return False
+        rel = rel_path.lstrip("/")
+        if not rel or rel.endswith("/"):
+            rel = (rel + "index.html") if rel else "index.html"
+        if self._serve_file(self.website_dist / rel):
+            return True
+        # Client-side routes (e.g. /dashboard) → index.html
+        if "." not in Path(rel).name:
+            return self._serve_file(self.website_dist / "index.html")
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path in ("/api/status", "/api/status.json"):
@@ -100,24 +140,37 @@ class StatusHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "status_path": str(self.status_path)})
             return
 
-        # Optional static website preview from dist/
-        if path == "/":
-            path = "/index.html"
-        candidate = (self.website_dist / path.lstrip("/")).resolve()
-        if str(candidate).startswith(str(self.website_dist.resolve())) and candidate.is_file():
-            ctype = "text/html"
-            if candidate.suffix == ".js":
-                ctype = "application/javascript"
-            elif candidate.suffix == ".css":
-                ctype = "text/css"
-            elif candidate.suffix == ".json":
-                ctype = "application/json"
-            elif candidate.suffix in (".png", ".jpg", ".jpeg", ".webp", ".svg"):
-                ctype = f"image/{candidate.suffix.lstrip('.').replace('svg', 'svg+xml')}"
-            self._send(200, candidate.read_bytes(), ctype)
+        # Vite/GitHub Pages build uses base + BrowserRouter basename "/apkleaks-skills".
+        # Strip that prefix so /apkleaks-skills/assets/... maps to website/dist/assets/...
+        site_prefix = "/apkleaks-skills"
+        if path == site_prefix or path.startswith(site_prefix + "/"):
+            rel = path[len(site_prefix) :] or "/"
+            if self._serve_spa(rel):
+                return
+        # Convenience: root and unprefixed SPA routes also work
+        if path in ("/", "/dashboard", "/features", "/skills", "/install"):
+            # Redirect browsers to the basename-aware app URL
+            target = f"{site_prefix}/" if path == "/" else f"{site_prefix}{path}"
+            body = f'<html><head><meta http-equiv="refresh" content="0;url={target}"></head><body><a href="{target}">{target}</a></body></html>'.encode()
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self._serve_spa(path):
             return
 
-        self._json({"ok": False, "error": "Not found", "paths": ["/api/status", "/api/health"]}, 404)
+        self._json(
+            {
+                "ok": False,
+                "error": "Not found",
+                "paths": ["/api/status", "/api/health", "/apkleaks-skills/", "/apkleaks-skills/dashboard"],
+            },
+            404,
+        )
 
     def log_message(self, fmt: str, *args) -> None:
         return
