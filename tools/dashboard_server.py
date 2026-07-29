@@ -19,7 +19,7 @@ TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from results_format import aggregate_results, is_noise_value  # noqa: E402
+from results_format import aggregate_results  # noqa: E402
 
 APKS_DIR = ROOT / "apks"
 RESULTS_DIR = ROOT / "results"
@@ -295,6 +295,8 @@ def load_status(status_path: Path) -> dict:
                 # Recompute cleaned raw lines from jobs (drop historical noise)
                 agg = aggregate_results(data.get("jobs") or [])
                 data["raw_lines"] = agg["lines"]
+                data["priority_lines"] = agg.get("priority_lines") or []
+                data["other_lines"] = agg.get("other_lines") or []
                 data["aws_pairs"] = agg["aws_pairs"]
                 data["counts"] = data.get("counts") or {}
                 data["counts"]["findings"] = len(agg["lines"])
@@ -341,17 +343,20 @@ def collect_results(status_path: Path) -> dict:
         if cur_has and not prev_has:
             by_name[name] = job
     agg = aggregate_results(list(by_name.values()))
-    # Never reintroduce noisy status lines
-    cleaned_status = [x for x in (status.get("raw_lines") or []) if not is_noise_value(x)]
-    for line in cleaned_status:
-        if line not in agg["lines"]:
-            agg["lines"].append(line)
-    agg["total"] = len(agg["lines"])
-    agg["text"] = "\n".join(agg["lines"]) + ("\n" if agg["lines"] else "")
-    # Refresh export file
-    export_path = RESULTS_DIR / "results.txt"
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    export_path.write_text(agg["text"], encoding="utf-8")
+    agg["total"] = len(agg.get("lines") or [])
+    agg["priority_total"] = len(agg.get("priority_lines") or [])
+    agg["other_total"] = len(agg.get("other_lines") or [])
+    agg["text"] = "\n".join(agg.get("lines") or []) + ("\n" if agg.get("lines") else "")
+    agg["priority_text"] = "\n".join(agg.get("priority_lines") or []) + (
+        "\n" if agg.get("priority_lines") else ""
+    )
+    agg["other_text"] = "\n".join(agg.get("other_lines") or []) + (
+        "\n" if agg.get("other_lines") else ""
+    )
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (RESULTS_DIR / "results.txt").write_text(agg["text"], encoding="utf-8")
+    (RESULTS_DIR / "priority-results.txt").write_text(agg["priority_text"], encoding="utf-8")
+    (RESULTS_DIR / "other-results.txt").write_text(agg["other_text"], encoding="utf-8")
     return agg
 
 
@@ -459,6 +464,16 @@ class StatusHandler(BaseHTTPRequestHandler):
         if path in ("/api/results.txt", "/api/export.txt"):
             agg = collect_results(self.status_path)
             self._send(200, agg["text"].encode("utf-8"), "text/plain; charset=utf-8")
+            return
+
+        if path in ("/api/results/priority.txt", "/api/export/priority.txt"):
+            agg = collect_results(self.status_path)
+            self._send(200, agg.get("priority_text", "").encode("utf-8"), "text/plain; charset=utf-8")
+            return
+
+        if path in ("/api/results/other.txt", "/api/export/other.txt"):
+            agg = collect_results(self.status_path)
+            self._send(200, agg.get("other_text", "").encode("utf-8"), "text/plain; charset=utf-8")
             return
 
         if path == "/api/download/status":

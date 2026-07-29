@@ -84,6 +84,8 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
         "jobs": [],
         "logs": [],
         "raw_lines": [],
+        "priority_lines": [],
+        "other_lines": [],
         "aws_pairs": [],
     }
 
@@ -142,6 +144,8 @@ def _scan_one(apk: Path, severity: str | None, pattern: str | None, jadx_args: s
         "finding_count": norm["finding_count"],
         "findings": findings,
         "raw_lines": norm["raw_lines"],
+        "priority_lines": norm["priority_lines"],
+        "other_lines": norm["other_lines"],
         "aws_pairs": norm["aws_pairs"],
         "hits": hits,
     }
@@ -211,16 +215,28 @@ def run_batch(
                 status["counts"]["has_sendgrid"] += 1
             if hits.get("stripe"):
                 status["counts"]["has_stripe"] += 1
-            for line in job.get("raw_lines") or []:
-                if line not in status["raw_lines"]:
-                    status["raw_lines"].append(line)
+            for line in job.get("priority_lines") or []:
+                if line not in status["priority_lines"]:
+                    status["priority_lines"].append(line)
+            for line in job.get("other_lines") or []:
+                if line not in status["other_lines"] and line not in status["priority_lines"]:
+                    status["other_lines"].append(line)
+            status["raw_lines"] = list(status["priority_lines"]) + list(status["other_lines"])
             for pair in job.get("aws_pairs") or []:
                 if pair not in status["aws_pairs"]:
                     status["aws_pairs"].append(pair)
-            # Keep a live exportable text file next to status.json
-            export_path = status_file.parent / "results.txt"
-            export_path.write_text(
+            out_dir = status_file.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "results.txt").write_text(
                 "\n".join(status["raw_lines"]) + ("\n" if status["raw_lines"] else ""),
+                encoding="utf-8",
+            )
+            (out_dir / "priority-results.txt").write_text(
+                "\n".join(status["priority_lines"]) + ("\n" if status["priority_lines"] else ""),
+                encoding="utf-8",
+            )
+            (out_dir / "other-results.txt").write_text(
+                "\n".join(status["other_lines"]) + ("\n" if status["other_lines"] else ""),
                 encoding="utf-8",
             )
             level = "info" if job["ok"] else "error"
@@ -248,6 +264,8 @@ def run_batch(
                 "finding_count": 0,
                 "findings": [],
                 "raw_lines": [],
+                "priority_lines": [],
+                "other_lines": [],
                 "aws_pairs": [],
                 "hits": {"aws": False, "sendgrid": False, "stripe": False},
             }
@@ -274,8 +292,12 @@ def run_batch(
     status["finished_at"] = _utc_now()
     agg = aggregate_results(status["jobs"])
     status["raw_lines"] = agg["lines"]
+    status["priority_lines"] = agg.get("priority_lines") or []
+    status["other_lines"] = agg.get("other_lines") or []
     status["aws_pairs"] = agg["aws_pairs"]
     (output_dir / "results.txt").write_text(agg["text"], encoding="utf-8")
+    (output_dir / "priority-results.txt").write_text(agg.get("priority_text") or "", encoding="utf-8")
+    (output_dir / "other-results.txt").write_text(agg.get("other_text") or "", encoding="utf-8")
     _append_log(status, "info", "Batch scan completed")
     _write_status(status_file, status)
     (output_dir / "summary.json").write_text(json.dumps(status, indent=2), encoding="utf-8")

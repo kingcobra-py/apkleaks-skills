@@ -75,9 +75,9 @@ class ResultsFormatTests(unittest.TestCase):
                     ],
                 },
                 {
-                    "name": "Stripe_API_Key",
-                    "severity": "critical",
-                    "matches": ["example_payment_token_not_real_value"],
+                    "name": "Generic_API_Key",
+                    "severity": "high",
+                    "matches": ["example_other_api_token_value_123456"],
                 },
             ],
         }
@@ -86,8 +86,26 @@ class ResultsFormatTests(unittest.TestCase):
             norm["aws_pairs"],
             ["AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
         )
-        self.assertIn("example_payment_token_not_real_value", norm["raw_other"])
-        self.assertEqual(norm["raw_lines"][0], norm["aws_pairs"][0])
+        self.assertIn(norm["aws_pairs"][0], norm["priority_lines"])
+        self.assertIn("example_other_api_token_value_123456", norm["other_lines"])
+
+    def test_priority_sendgrid_and_sk_live(self):
+        sg = "SG." + ("A" * 22) + "." + ("B" * 43)
+        # Build at runtime so repo secret scanners do not flag the fixture literal.
+        sk = "sk_" + "live_" + ("x" * 24)
+        twilio = "SK" + ("ab" * 16)
+        job = {
+            "apk": "pay.apk",
+            "findings": [
+                {"name": "SendGrid_API_Key", "matches": [sg]},
+                {"name": "Stripe_API_Key", "matches": [sk]},
+                {"name": "Twilio_API_Key", "matches": [twilio]},
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertIn(sg, norm["priority_lines"])
+        self.assertIn(sk, norm["priority_lines"])
+        self.assertIn(twilio, norm["other_lines"])
 
     def test_filters_common_false_positives(self):
         job = {
@@ -97,7 +115,7 @@ class ResultsFormatTests(unittest.TestCase):
                 {"name": "Authorization_Basic", "matches": ["basic whitelist"]},
                 {"name": "JSON_Web_Token", "matches": ["androidGradlePluginVersion=8.5.1"]},
                 {"name": "Artifactory_Password", "matches": ["APAL4kC0GxjHdgKa81GDVnY4PHvCTiJidX1O14BnoU0"]},
-                {"name": "SendGrid_API_Key", "matches": ["example_mail_api_token_value_123456"]},
+                {"name": "Generic_API_Key", "matches": ["example_mail_api_token_value_123456"]},
             ],
         }
         norm = normalize_job_findings(job)
@@ -105,28 +123,28 @@ class ResultsFormatTests(unittest.TestCase):
         self.assertNotIn("ads.s3.amazonaws.com", norm["raw_lines"])
         self.assertNotIn("basic whitelist", norm["raw_lines"])
         self.assertNotIn("androidGradlePluginVersion=8.5.1", norm["raw_lines"])
-        self.assertIn("example_mail_api_token_value_123456", norm["raw_lines"])
+        self.assertIn("example_mail_api_token_value_123456", norm["other_lines"])
 
     def test_aggregate_dedupes(self):
+        pair = "AKIAIOSFODNN7EXAMPLE:secretsecretsecretsecretsecretsecre"
         jobs = [
             {
                 "apk": "a.apk",
-                "raw_lines": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
-                "aws_pairs": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
+                "priority_lines": [pair],
+                "other_lines": [],
+                "aws_pairs": [pair],
             },
             {
                 "apk": "b.apk",
-                "raw_lines": [
-                    "AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre",
-                    "example_other_token_abcdefghij",
-                    "ads.s3.amazonaws.com",
-                ],
-                "aws_pairs": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
+                "priority_lines": [pair],
+                "other_lines": ["example_other_token_abcdefghij"],
+                "aws_pairs": [pair],
+                "raw_lines": [pair, "example_other_token_abcdefghij", "ads.s3.amazonaws.com"],
             },
         ]
         agg = aggregate_results(jobs)
-        self.assertEqual(agg["total"], 2)
-        self.assertEqual(len(agg["aws_pairs"]), 1)
+        self.assertEqual(agg["priority_total"], 1)
+        self.assertEqual(agg["other_total"], 1)
         self.assertNotIn("ads.s3.amazonaws.com", agg["lines"])
 
 

@@ -99,7 +99,7 @@ const DEMO: Status = {
   logs: [{ ts: '2026-07-29T21:00:01+00:00', level: 'info', message: 'Discovered 100 APK(s); threads=4' }],
   raw_lines: [
     'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-    'example_payment_token_not_real',
+    'example_other_api_token_value_123456',
   ],
   aws_pairs: ['AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
   system: {
@@ -110,6 +110,20 @@ const DEMO: Status = {
     scan_running: true,
     config: { threads: 4, download_count: 100 },
   },
+};
+
+const monoBoxStyle: React.CSSProperties = {
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  fontSize: 12,
+  lineHeight: 1.7,
+  maxHeight: 280,
+  overflow: 'auto',
+  background: '#0f172a',
+  color: '#e2e8f0',
+  padding: 16,
+  borderRadius: 8,
+  whiteSpace: 'pre-wrap',
+  wordBreak: 'break-all',
 };
 
 const apiBaseCandidates = ['', 'http://127.0.0.1:8787'];
@@ -133,7 +147,10 @@ const DashboardPage: React.FC = () => {
   const [threads, setThreads] = useState<number>(4);
   const [busyDownload, setBusyDownload] = useState(false);
   const [busyThreads, setBusyThreads] = useState(false);
-  const [resultsLines, setResultsLines] = useState<string[]>([]);
+  const [priorityLines, setPriorityLines] = useState<string[]>([
+    'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+  ]);
+  const [otherLines, setOtherLines] = useState<string[]>(['example_other_api_token_value_123456']);
 
   const refresh = useCallback(async () => {
     const res = await apiFetch('/api/status');
@@ -149,9 +166,8 @@ const DashboardPage: React.FC = () => {
     const resultsRes = await apiFetch('/api/results');
     if (resultsRes?.ok) {
       const agg = await resultsRes.json();
-      if (Array.isArray(agg?.lines)) setResultsLines(agg.lines);
-    } else if (data.raw_lines) {
-      setResultsLines(data.raw_lines);
+      if (Array.isArray(agg?.priority_lines)) setPriorityLines(agg.priority_lines);
+      if (Array.isArray(agg?.other_lines)) setOtherLines(agg.other_lines);
     }
   }, []);
 
@@ -209,19 +225,31 @@ const DashboardPage: React.FC = () => {
     }
   };
 
-  const onExportTxt = async () => {
-    const res = await apiFetch('/api/results.txt');
-    let text = resultsLines.join('\n');
-    if (res?.ok) text = await res.text();
-    const blob = new Blob([text.endsWith('\n') || !text ? text : `${text}\n`], { type: 'text/plain;charset=utf-8' });
+  const downloadText = (filename: string, text: string) => {
+    const body = text.endsWith('\n') || !text ? text : `${text}\n`;
+    const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'apkleaks-results.txt';
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  };
+
+  const onExportPriority = async () => {
+    const res = await apiFetch('/api/results/priority.txt');
+    let text = priorityLines.join('\n');
+    if (res?.ok) text = await res.text();
+    downloadText('priority-results.txt', text);
+  };
+
+  const onExportOther = async () => {
+    const res = await apiFetch('/api/results/other.txt');
+    let text = otherLines.join('\n');
+    if (res?.ok) text = await res.text();
+    downloadText('other-apis-results.txt', text);
   };
 
   const stateColor = status.state === 'completed' ? 'success' : status.state === 'running' ? 'processing' : 'default';
@@ -372,8 +400,10 @@ const DashboardPage: React.FC = () => {
               <Tag color="success">{status.progress.succeeded} ok</Tag>
               <Tag color="error">{status.progress.failed} failed</Tag>
               <Tag>threads: {status.threads ?? '—'}</Tag>
-              <Tag icon={<ApiOutlined />}>secrets: {status.counts.findings}</Tag>
-              <Tag color="orange">AWS pairs: {(status.aws_pairs || []).length}</Tag>
+              <Tag icon={<ApiOutlined />} color="orange">
+                priority: {priorityLines.length}
+              </Tag>
+              <Tag icon={<ApiOutlined />}>other APIs: {otherLines.length}</Tag>
             </Space>
             {status.current?.length ? (
               <Paragraph style={{ marginTop: 16, marginBottom: 0 }}>
@@ -390,40 +420,50 @@ const DashboardPage: React.FC = () => {
       </Row>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        <Col xs={24}>
+        <Col xs={24} lg={12}>
           <Card
             className="glass-card"
             title={
               <Space>
-                <SecurityScanOutlined /> Results (raw)
-                <Tag>{resultsLines.length}</Tag>
+                <SecurityScanOutlined /> Priority secrets
+                <Tag color="orange">{priorityLines.length}</Tag>
               </Space>
             }
             extra={
-              <Button icon={<DownloadOutlined />} onClick={onExportTxt}>
-                Export to TXT
+              <Button icon={<DownloadOutlined />} onClick={onExportPriority}>
+                Export TXT
               </Button>
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              AWS shown as <Text code>AwsKey:AwsSecretKey</Text>. Other hits are raw secret/API values only.
+              AWS as <Text code>AwsKey:AwsSecretKey</Text>, plus SendGrid (<Text code>SG.</Text>) and Stripe{' '}
+              <Text code>sk_live_</Text>.
             </Paragraph>
-            <div
-              style={{
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                fontSize: 12,
-                lineHeight: 1.7,
-                maxHeight: 320,
-                overflow: 'auto',
-                background: '#0f172a',
-                color: '#e2e8f0',
-                padding: 16,
-                borderRadius: 8,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-all',
-              }}
-            >
-              {resultsLines.length ? resultsLines.join('\n') : <Text type="secondary">No secrets found yet.</Text>}
+            <div style={monoBoxStyle}>
+              {priorityLines.length ? priorityLines.join('\n') : <Text type="secondary">No AWS / SendGrid / sk_live hits yet.</Text>}
+            </div>
+          </Card>
+        </Col>
+        <Col xs={24} lg={12}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <ApiOutlined /> Other APIs
+                <Tag>{otherLines.length}</Tag>
+              </Space>
+            }
+            extra={
+              <Button icon={<DownloadOutlined />} onClick={onExportOther}>
+                Export TXT
+              </Button>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              Any other API keys / tokens found (raw values only).
+            </Paragraph>
+            <div style={monoBoxStyle}>
+              {otherLines.length ? otherLines.join('\n') : <Text type="secondary">No other API secrets yet.</Text>}
             </div>
           </Card>
         </Col>
