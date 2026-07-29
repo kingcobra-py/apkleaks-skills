@@ -32,6 +32,7 @@ import tempfile
 import subprocess
 import re
 import logging
+import logging.config
 import time
 
 # Lazy import — MCP lifecycle (initialize/ping) works without heavy deps.
