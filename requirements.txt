@@ -1,1 +1,2 @@
 pyaxmlparser>=0.3.24
+tqdm>=4.66.0

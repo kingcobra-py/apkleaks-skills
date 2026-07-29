@@ -61,7 +61,8 @@ VERSION = "1.0.0"
 
 SEVERITY_MAP = {
     "Amazon_AWS_Access_Key_ID": "critical", "Amazon_AWS_S3_Bucket": "critical",
-    "AWS_API_Key": "critical", "Artifactory_API_Token": "high",
+    "AWS_API_Key": "critical", "AWS_Secret_Access_Key": "critical",
+    "Artifactory_API_Token": "high",
     "Artifactory_Password": "critical", "Authorization_Basic": "critical",
     "Authorization_Bearer": "critical", "Basic_Auth_Credentials": "critical",
     "Cloudinary_Basic_Auth": "high", "DEFCON_CTF_Flag": "info",
@@ -136,6 +137,7 @@ EXPLANATIONS = {
     "Amazon_AWS_Access_Key_ID": "AWS Access Key IDs (AKIA prefix) identify an IAM user. If found with the secret key, an attacker gets full AWS access. Rotate immediately.",
     "Amazon_AWS_S3_Bucket": "S3 bucket URLs may expose stored data. Check for public access. Misconfigured buckets are a common data leak vector.",
     "AWS_API_Key": "AWS API keys provide access to Amazon Web Services. Compromised keys allow attackers to access resources or incur charges.",
+    "AWS_Secret_Access_Key": "AWS Secret Access Keys are long-term IAM credentials (typically 40-character base64). Paired with an Access Key ID they grant full account access. Rotate in IAM immediately and prefer temporary credentials.",
     "Microsoft_Azure_Client_Secret": "Azure client secrets authenticate applications to Microsoft Entra ID (Azure AD). A leaked secret allows impersonation of the app and access to all granted resources. Rotate in the Azure Portal under App Registrations.",
     "Microsoft_Azure_Connection_String": "Azure Storage connection strings contain the account name and key. Full access to the storage account (blobs, queues, tables, files). Rotate in the Azure Portal under Storage Account > Access Keys.",
     "DigitalOcean_API_Token": "DigitalOcean API tokens (dop_v1_ prefix) provide full access to Droplets, Spaces, and other DO resources. Revoke at cloud.digitalocean.com/account/api/tokens.",
@@ -441,6 +443,7 @@ def cmd_schema(args):
             "explanation_coverage_pct": round(len(EXPLANATIONS) / len(SEVERITY_MAP) * 100, 1),
             "pattern_categories": {
                 "cloud_providers": ["Amazon_AWS_Access_Key_ID", "Amazon_AWS_S3_Bucket", "AWS_API_Key",
+                    "AWS_Secret_Access_Key",
                     "Microsoft_Azure_Client_Secret", "Microsoft_Azure_Connection_String",
                     "DigitalOcean_API_Token", "DigitalOcean_OAuth_Token",
                     "Alibaba_Access_Key_ID", "Alibaba_Access_Key_Secret",
