@@ -97,8 +97,9 @@ const DEMO: Status = {
 };
 
 const statusEndpoints = [
-  'http://127.0.0.1:8787/api/status',
+  // Prefer same-origin first so a remote VPS deploy (dashboard_server) works in-browser.
   '/api/status',
+  'http://127.0.0.1:8787/api/status',
 ];
 
 const DashboardPage: React.FC = () => {
