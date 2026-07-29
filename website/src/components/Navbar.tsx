@@ -22,6 +22,7 @@ const Navbar: React.FC = () => {
     { key: '/features', label: <Link to="/features">{t('nav.features')}</Link> },
     { key: '/skills', label: <Link to="/skills">{t('nav.skills')}</Link> },
     { key: '/install', label: <Link to="/install">{t('nav.install')}</Link> },
+    { key: '/dashboard', label: <Link to="/dashboard">{t('nav.dashboard')}</Link> },
   ];
 
   return (

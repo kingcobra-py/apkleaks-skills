@@ -375,6 +375,26 @@ Direct execution; requires `pip install -e .` (or `pip install -r requirements.t
 
 Drop the config into your project's `.claude/settings.json` and Claude Code starts the MCP server automatically when the project opens. (The CLI surface needs no setup — the agent just calls it via Bash.)
 
+## Batch scan (F-Droid → threaded scan → dashboard)
+
+For bulk research on **authorized / open-source** APKs:
+
+```bash
+# 1) Download N APKs from the official F-Droid repo
+python3 tools/fdroid_download.py -n 100 -o apks
+
+# 2) Scan them in parallel (progress bar + results/status.json logs)
+pip install -r requirements.txt
+python3 tools/batch_scan.py -d apks -t 4 -o results -s high
+
+# 3) Serve live status for the website dashboard
+python3 tools/dashboard_server.py   # http://127.0.0.1:8787/api/status
+```
+
+Website route: `/dashboard` (demo data by default; switches to LIVE when the status API is up).
+
+New detection: `AWS_Secret_Access_Key` (matches `aws_secret_access_key = <40-char secret>` style assignments).
+
 ## Detection coverage
 
 **95+ regex patterns across 12 categories**, each mapped to a severity and an explanation (impact + remediation):

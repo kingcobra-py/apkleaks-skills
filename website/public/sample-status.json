@@ -1,0 +1,65 @@
+{
+  "ok": true,
+  "demo": true,
+  "state": "running",
+  "started_at": "2026-07-29T21:00:00+00:00",
+  "updated_at": "2026-07-29T21:12:40+00:00",
+  "finished_at": null,
+  "input_dir": "apks",
+  "output_dir": "results",
+  "threads": 4,
+  "progress": {
+    "total": 100,
+    "completed": 42,
+    "succeeded": 40,
+    "failed": 2,
+    "percent": 42.0
+  },
+  "counts": {
+    "findings": 128,
+    "critical": 11,
+    "high": 37,
+    "has_aws": 3,
+    "has_sendgrid": 1,
+    "has_stripe": 2
+  },
+  "current": [
+    "org.example.app.apk",
+    "com.demo.wallet.apk"
+  ],
+  "jobs": [
+    {
+      "apk": "org.fdroid.fdroid.apk",
+      "ok": true,
+      "finding_count": 2,
+      "has_critical": false,
+      "duration_ms": 51200,
+      "hits": { "aws": false, "sendgrid": false, "stripe": false }
+    },
+    {
+      "apk": "com.demo.payments.apk",
+      "ok": true,
+      "finding_count": 5,
+      "has_critical": true,
+      "duration_ms": 78410,
+      "hits": { "aws": true, "sendgrid": false, "stripe": true }
+    }
+  ],
+  "logs": [
+    {
+      "ts": "2026-07-29T21:00:01+00:00",
+      "level": "info",
+      "message": "Discovered 100 APK(s); threads=4"
+    },
+    {
+      "ts": "2026-07-29T21:08:44+00:00",
+      "level": "info",
+      "message": "Done com.demo.payments.apk: findings=5 ok=True (78410 ms)"
+    },
+    {
+      "ts": "2026-07-29T21:10:02+00:00",
+      "level": "error",
+      "message": "Done broken.sample.apk: findings=0 ok=False (1200 ms)"
+    }
+  ]
+}
