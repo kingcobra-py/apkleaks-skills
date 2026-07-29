@@ -77,7 +77,7 @@ class ResultsFormatTests(unittest.TestCase):
                 {
                     "name": "Stripe_API_Key",
                     "severity": "critical",
-                    "matches": ["example_payment_token_not_real"],
+                    "matches": ["example_payment_token_not_real_value"],
                 },
             ],
         }
@@ -86,25 +86,48 @@ class ResultsFormatTests(unittest.TestCase):
             norm["aws_pairs"],
             ["AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
         )
-        self.assertIn("example_payment_token_not_real", norm["raw_other"])
+        self.assertIn("example_payment_token_not_real_value", norm["raw_other"])
         self.assertEqual(norm["raw_lines"][0], norm["aws_pairs"][0])
+
+    def test_filters_common_false_positives(self):
+        job = {
+            "apk": "noisy.apk",
+            "findings": [
+                {"name": "Amazon_AWS_S3_Bucket", "matches": ["ads.s3.amazonaws.com"]},
+                {"name": "Authorization_Basic", "matches": ["basic whitelist"]},
+                {"name": "JSON_Web_Token", "matches": ["androidGradlePluginVersion=8.5.1"]},
+                {"name": "Artifactory_Password", "matches": ["APAL4kC0GxjHdgKa81GDVnY4PHvCTiJidX1O14BnoU0"]},
+                {"name": "SendGrid_API_Key", "matches": ["example_mail_api_token_value_123456"]},
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertEqual(norm["aws_pairs"], [])
+        self.assertNotIn("ads.s3.amazonaws.com", norm["raw_lines"])
+        self.assertNotIn("basic whitelist", norm["raw_lines"])
+        self.assertNotIn("androidGradlePluginVersion=8.5.1", norm["raw_lines"])
+        self.assertIn("example_mail_api_token_value_123456", norm["raw_lines"])
 
     def test_aggregate_dedupes(self):
         jobs = [
             {
                 "apk": "a.apk",
-                "raw_lines": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
-                "aws_pairs": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
+                "raw_lines": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
+                "aws_pairs": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
             },
             {
                 "apk": "b.apk",
-                "raw_lines": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre", "tok_abc"],
-                "aws_pairs": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
+                "raw_lines": [
+                    "AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre",
+                    "example_other_token_abcdefghij",
+                    "ads.s3.amazonaws.com",
+                ],
+                "aws_pairs": ["AKIAEXAMPLE00000000:secretsecretsecretsecretsecretsecre"],
             },
         ]
         agg = aggregate_results(jobs)
         self.assertEqual(agg["total"], 2)
         self.assertEqual(len(agg["aws_pairs"]), 1)
+        self.assertNotIn("ads.s3.amazonaws.com", agg["lines"])
 
 
 if __name__ == "__main__":

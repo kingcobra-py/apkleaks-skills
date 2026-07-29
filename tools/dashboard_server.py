@@ -19,7 +19,7 @@ TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from results_format import aggregate_results  # noqa: E402
+from results_format import aggregate_results, is_noise_value  # noqa: E402
 
 APKS_DIR = ROOT / "apks"
 RESULTS_DIR = ROOT / "results"
@@ -292,11 +292,13 @@ def load_status(status_path: Path) -> dict:
         try:
             data = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # Ensure raw_lines present even for older status files
-                if "raw_lines" not in data:
-                    agg = aggregate_results(data.get("jobs") or [])
-                    data["raw_lines"] = agg["lines"]
-                    data["aws_pairs"] = agg["aws_pairs"]
+                # Recompute cleaned raw lines from jobs (drop historical noise)
+                agg = aggregate_results(data.get("jobs") or [])
+                data["raw_lines"] = agg["lines"]
+                data["aws_pairs"] = agg["aws_pairs"]
+                data["counts"] = data.get("counts") or {}
+                data["counts"]["findings"] = len(agg["lines"])
+                data["counts"]["has_aws"] = len(agg["aws_pairs"])
                 data["demo"] = False
                 return data
         except json.JSONDecodeError:
@@ -311,7 +313,12 @@ def collect_results(status_path: Path) -> dict:
     # Also merge per-APK result JSON files
     if RESULTS_DIR.is_dir():
         for path in RESULTS_DIR.glob("*.json"):
-            if path.name in {"status.json", "summary.json", "dashboard-config.json", "download-status.json"}:
+            if path.name in {
+                "status.json",
+                "summary.json",
+                "dashboard-config.json",
+                "download-status.json",
+            }:
                 continue
             try:
                 job = json.loads(path.read_text(encoding="utf-8"))
@@ -319,23 +326,32 @@ def collect_results(status_path: Path) -> dict:
                 continue
             if isinstance(job, dict) and job.get("apk"):
                 jobs.append(job)
-    # Deduplicate by apk name (prefer latest with raw_lines)
+    # Deduplicate by apk name (prefer jobs that still have findings/results)
     by_name: dict[str, dict] = {}
     for job in jobs:
         name = job.get("apk") or ""
         if not name:
             continue
         prev = by_name.get(name)
-        if prev is None or (job.get("raw_lines") and not prev.get("raw_lines")):
+        if prev is None:
+            by_name[name] = job
+            continue
+        prev_has = bool(prev.get("findings") or prev.get("results"))
+        cur_has = bool(job.get("findings") or job.get("results"))
+        if cur_has and not prev_has:
             by_name[name] = job
     agg = aggregate_results(list(by_name.values()))
-    # Prefer live status raw_lines if richer
-    status_lines = status.get("raw_lines") or []
-    if len(status_lines) > len(agg["lines"]):
-        agg["lines"] = status_lines
-        agg["aws_pairs"] = status.get("aws_pairs") or agg["aws_pairs"]
-        agg["text"] = "\n".join(status_lines) + ("\n" if status_lines else "")
-        agg["total"] = len(status_lines)
+    # Never reintroduce noisy status lines
+    cleaned_status = [x for x in (status.get("raw_lines") or []) if not is_noise_value(x)]
+    for line in cleaned_status:
+        if line not in agg["lines"]:
+            agg["lines"].append(line)
+    agg["total"] = len(agg["lines"])
+    agg["text"] = "\n".join(agg["lines"]) + ("\n" if agg["lines"] else "")
+    # Refresh export file
+    export_path = RESULTS_DIR / "results.txt"
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    export_path.write_text(agg["text"], encoding="utf-8")
     return agg
 
 
