@@ -1,5 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Badge, Card, Col, Progress, Row, Space, Table, Tag, Typography, Alert } from 'antd';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Badge,
+  Button,
+  Card,
+  Col,
+  InputNumber,
+  Progress,
+  Row,
+  Space,
+  Table,
+  Tag,
+  Typography,
+  Alert,
+  message,
+} from 'antd';
 import {
   CloudDownloadOutlined,
   ThunderboltOutlined,
@@ -8,6 +22,9 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   SyncOutlined,
+  DownloadOutlined,
+  DashboardOutlined,
+  HddOutlined,
 } from '@ant-design/icons';
 import { motion } from 'framer-motion';
 
@@ -22,6 +39,20 @@ type Job = {
   duration_ms?: number;
   hits?: { aws?: boolean; sendgrid?: boolean; stripe?: boolean };
   error?: string;
+  raw_lines?: string[];
+  aws_pairs?: string[];
+};
+type SystemStats = {
+  cpu_percent?: number;
+  memory?: {
+    percent?: number;
+    used_gb?: number;
+    total_gb?: number;
+  };
+  apk_count?: number;
+  download_running?: boolean;
+  scan_running?: boolean;
+  config?: { threads?: number; download_count?: number };
 };
 type Status = {
   ok: boolean;
@@ -45,6 +76,10 @@ type Status = {
   current: string[];
   jobs: Job[];
   logs: LogLine[];
+  raw_lines?: string[];
+  aws_pairs?: string[];
+  system?: SystemStats;
+  config?: { threads?: number; download_count?: number };
 };
 
 const DEMO: Status = {
@@ -58,70 +93,73 @@ const DEMO: Status = {
   updated_at: '2026-07-29T21:12:40+00:00',
   finished_at: null,
   progress: { total: 100, completed: 42, succeeded: 40, failed: 2, percent: 42 },
-  counts: { findings: 128, critical: 11, high: 37, has_aws: 3, has_sendgrid: 1, has_stripe: 2 },
-  current: ['org.example.app.apk', 'com.demo.wallet.apk'],
-  jobs: [
-    {
-      apk: 'org.fdroid.fdroid.apk',
-      ok: true,
-      finding_count: 2,
-      has_critical: false,
-      duration_ms: 51200,
-      hits: { aws: false, sendgrid: false, stripe: false },
-    },
-    {
-      apk: 'com.demo.payments.apk',
-      ok: true,
-      finding_count: 5,
-      has_critical: true,
-      duration_ms: 78410,
-      hits: { aws: true, sendgrid: false, stripe: true },
-    },
-    {
-      apk: 'broken.sample.apk',
-      ok: false,
-      finding_count: 0,
-      has_critical: false,
-      duration_ms: 1200,
-      error: 'INVALID_APK',
-      hits: { aws: false, sendgrid: false, stripe: false },
-    },
+  counts: { findings: 3, critical: 1, high: 2, has_aws: 1, has_sendgrid: 0, has_stripe: 1 },
+  current: ['org.example.app.apk'],
+  jobs: [],
+  logs: [{ ts: '2026-07-29T21:00:01+00:00', level: 'info', message: 'Discovered 100 APK(s); threads=4' }],
+  raw_lines: [
+    'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'example_payment_token_not_real',
   ],
-  logs: [
-    { ts: '2026-07-29T21:00:01+00:00', level: 'info', message: 'Discovered 100 APK(s); threads=4' },
-    { ts: '2026-07-29T21:05:12+00:00', level: 'info', message: 'Done org.fdroid.fdroid.apk: findings=2 ok=True (51200 ms)' },
-    { ts: '2026-07-29T21:08:44+00:00', level: 'info', message: 'Done com.demo.payments.apk: findings=5 ok=True (78410 ms)' },
-    { ts: '2026-07-29T21:10:02+00:00', level: 'error', message: 'Done broken.sample.apk: findings=0 ok=False (1200 ms)' },
-    { ts: '2026-07-29T21:12:10+00:00', level: 'info', message: 'Scanning org.example.app.apk' },
-  ],
+  aws_pairs: ['AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'],
+  system: {
+    cpu_percent: 12.5,
+    memory: { percent: 18.2, used_gb: 22.1, total_gb: 125 },
+    apk_count: 99,
+    download_running: false,
+    scan_running: true,
+    config: { threads: 4, download_count: 100 },
+  },
 };
 
-const statusEndpoints = [
-  // Prefer same-origin first so a remote VPS deploy (dashboard_server) works in-browser.
-  '/api/status',
-  'http://127.0.0.1:8787/api/status',
-];
+const apiBaseCandidates = ['', 'http://127.0.0.1:8787'];
+
+async function apiFetch(path: string, init?: RequestInit): Promise<Response | null> {
+  for (const base of apiBaseCandidates) {
+    try {
+      const res = await fetch(`${base}${path}`, { cache: 'no-store', ...init });
+      if (res.ok || res.status < 500) return res;
+    } catch {
+      // try next
+    }
+  }
+  return null;
+}
 
 const DashboardPage: React.FC = () => {
   const [status, setStatus] = useState<Status>(DEMO);
   const [source, setSource] = useState<'demo' | 'live'>('demo');
+  const [downloadCount, setDownloadCount] = useState<number>(100);
+  const [threads, setThreads] = useState<number>(4);
+  const [busyDownload, setBusyDownload] = useState(false);
+  const [busyThreads, setBusyThreads] = useState(false);
+  const [resultsLines, setResultsLines] = useState<string[]>([]);
+
+  const refresh = useCallback(async () => {
+    const res = await apiFetch('/api/status');
+    if (!res || !res.ok) return;
+    const data = (await res.json()) as Status;
+    if (!data?.progress) return;
+    setStatus(data);
+    setSource(data.demo ? 'demo' : 'live');
+    if (data.config?.download_count) setDownloadCount(data.config.download_count);
+    if (data.config?.threads) setThreads(data.config.threads);
+    else if (data.threads) setThreads(data.threads);
+
+    const resultsRes = await apiFetch('/api/results');
+    if (resultsRes?.ok) {
+      const agg = await resultsRes.json();
+      if (Array.isArray(agg?.lines)) setResultsLines(agg.lines);
+    } else if (data.raw_lines) {
+      setResultsLines(data.raw_lines);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      for (const url of statusEndpoints) {
-        try {
-          const res = await fetch(url, { cache: 'no-store' });
-          if (!res.ok) continue;
-          const data = (await res.json()) as Status;
-          if (cancelled || !data?.progress) continue;
-          setStatus(data);
-          setSource(data.demo ? 'demo' : 'live');
-          return;
-        } catch {
-          // try next endpoint
-        }
-      }
+      if (cancelled) return;
+      await refresh();
     };
     tick();
     const id = window.setInterval(tick, 2500);
@@ -129,9 +167,67 @@ const DashboardPage: React.FC = () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [refresh]);
+
+  const onDownload = async () => {
+    setBusyDownload(true);
+    try {
+      const res = await apiFetch('/api/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: downloadCount }),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Download failed to start');
+      } else {
+        message.success(data.message || `Downloading ${downloadCount} APKs`);
+      }
+      await refresh();
+    } finally {
+      setBusyDownload(false);
+    }
+  };
+
+  const onApplyThreads = async () => {
+    setBusyThreads(true);
+    try {
+      const res = await apiFetch('/api/threads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ threads, restart: true }),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to update threads');
+      } else {
+        message.success(data.message || `Scan restarted with ${threads} threads`);
+      }
+      await refresh();
+    } finally {
+      setBusyThreads(false);
+    }
+  };
+
+  const onExportTxt = async () => {
+    const res = await apiFetch('/api/results.txt');
+    let text = resultsLines.join('\n');
+    if (res?.ok) text = await res.text();
+    const blob = new Blob([text.endsWith('\n') || !text ? text : `${text}\n`], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'apkleaks-results.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   const stateColor = status.state === 'completed' ? 'success' : status.state === 'running' ? 'processing' : 'default';
+  const sys = status.system;
+  const cpu = sys?.cpu_percent ?? 0;
+  const mem = sys?.memory?.percent ?? 0;
 
   const columns = useMemo(
     () => [
@@ -145,6 +241,7 @@ const DashboardPage: React.FC = () => {
         title: 'Status',
         dataIndex: 'ok',
         key: 'ok',
+        width: 100,
         render: (ok: boolean) =>
           ok ? (
             <Tag icon={<CheckCircleOutlined />} color="success">
@@ -157,32 +254,16 @@ const DashboardPage: React.FC = () => {
           ),
       },
       {
-        title: 'Findings',
+        title: 'Secrets',
         dataIndex: 'finding_count',
         key: 'finding_count',
-        render: (n: number, row: Job) => (
-          <Space>
-            <Text>{n ?? 0}</Text>
-            {row.has_critical ? <Tag color="magenta">critical</Tag> : null}
-          </Space>
-        ),
-      },
-      {
-        title: 'Hits',
-        key: 'hits',
-        render: (_: unknown, row: Job) => (
-          <Space wrap>
-            {row.hits?.aws ? <Tag color="orange">AWS</Tag> : null}
-            {row.hits?.sendgrid ? <Tag color="blue">SendGrid</Tag> : null}
-            {row.hits?.stripe ? <Tag color="purple">Stripe</Tag> : null}
-            {!row.hits?.aws && !row.hits?.sendgrid && !row.hits?.stripe ? <Text type="secondary">—</Text> : null}
-          </Space>
-        ),
+        width: 90,
       },
       {
         title: 'Duration',
         dataIndex: 'duration_ms',
         key: 'duration_ms',
+        width: 100,
         render: (ms?: number) => (ms != null ? `${(ms / 1000).toFixed(1)}s` : '—'),
       },
     ],
@@ -190,17 +271,20 @@ const DashboardPage: React.FC = () => {
   );
 
   return (
-    <div style={{ padding: '48px 24px', maxWidth: 1200, margin: '0 auto' }}>
+    <div style={{ padding: '32px 24px', maxWidth: 1200, margin: '0 auto' }}>
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
-        <Space align="center" style={{ marginBottom: 8 }}>
+        <Space align="center" style={{ marginBottom: 8 }} wrap>
           <Title level={2} style={{ margin: 0 }}>
             Batch Scan Dashboard
           </Title>
           <Badge status={stateColor as 'success' | 'processing' | 'default'} text={status.state.toUpperCase()} />
           <Tag color={source === 'live' ? 'green' : 'gold'}>{source === 'live' ? 'LIVE' : 'DEMO'}</Tag>
+          {sys?.download_running ? <Tag color="blue">DOWNLOADING</Tag> : null}
+          {sys?.scan_running ? <Tag color="purple">SCANNING</Tag> : null}
         </Space>
-        <Paragraph type="secondary" style={{ maxWidth: 720 }}>
-          Download APKs from F-Droid, scan many files in parallel, and watch progress, logs, and AWS / SendGrid / Stripe hits in one place.
+        <Paragraph type="secondary" style={{ maxWidth: 760 }}>
+          Download unique F-Droid APKs, control scan threads, watch CPU/RAM, and export raw secrets (AWS as{' '}
+          <Text code>AwsKey:AwsSecretKey</Text>).
         </Paragraph>
       </motion.div>
 
@@ -210,17 +294,71 @@ const DashboardPage: React.FC = () => {
           type="info"
           showIcon
           message="Showing demo data"
-          description={
-            <span>
-              Start the API with <Text code>python3 tools/dashboard_server.py</Text> after a batch scan writes{' '}
-              <Text code>results/status.json</Text>.
-            </span>
-          }
+          description="Start the dashboard API on the VPS to switch to LIVE status and controls."
         />
       )}
 
-      <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
-        <Col xs={24} md={16}>
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24} md={8}>
+          <Card className="glass-card" title={<Space><CloudDownloadOutlined /> Download APKs</Space>}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <div>
+                <Text type="secondary">Number of new APKs (skips duplicates)</Text>
+                <InputNumber
+                  min={1}
+                  max={5000}
+                  value={downloadCount}
+                  onChange={(v) => setDownloadCount(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                />
+              </div>
+              <Button type="primary" block loading={busyDownload} icon={<CloudDownloadOutlined />} onClick={onDownload}>
+                Start download
+              </Button>
+              <Text type="secondary">On disk: {sys?.apk_count ?? '—'} APKs</Text>
+            </Space>
+          </Card>
+        </Col>
+        <Col xs={24} md={8}>
+          <Card className="glass-card" title={<Space><ThunderboltOutlined /> Scan threads</Space>}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <div>
+                <Text type="secondary">Worker threads (1–32)</Text>
+                <InputNumber
+                  min={1}
+                  max={32}
+                  value={threads}
+                  onChange={(v) => setThreads(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                />
+              </div>
+              <Button type="primary" block loading={busyThreads} icon={<ThunderboltOutlined />} onClick={onApplyThreads}>
+                Apply & restart scan
+              </Button>
+              <Text type="secondary">Active setting: {status.threads ?? threads}</Text>
+            </Space>
+          </Card>
+        </Col>
+        <Col xs={24} md={8}>
+          <Card className="glass-card" title={<Space><DashboardOutlined /> System</Space>}>
+            <Space direction="vertical" style={{ width: '100%' }} size="middle">
+              <div>
+                <Text type="secondary">CPU</Text>
+                <Progress percent={Math.min(100, Number(cpu) || 0)} status="active" strokeColor="#06b6d4" />
+              </div>
+              <div>
+                <Text type="secondary">
+                  <HddOutlined /> RAM {sys?.memory?.used_gb ?? '—'} / {sys?.memory?.total_gb ?? '—'} GB
+                </Text>
+                <Progress percent={Math.min(100, Number(mem) || 0)} strokeColor="#818cf8" />
+              </div>
+            </Space>
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
           <Card className="glass-card" title="Progress">
             <Progress
               percent={status.progress.percent}
@@ -234,6 +372,8 @@ const DashboardPage: React.FC = () => {
               <Tag color="success">{status.progress.succeeded} ok</Tag>
               <Tag color="error">{status.progress.failed} failed</Tag>
               <Tag>threads: {status.threads ?? '—'}</Tag>
+              <Tag icon={<ApiOutlined />}>secrets: {status.counts.findings}</Tag>
+              <Tag color="orange">AWS pairs: {(status.aws_pairs || []).length}</Tag>
             </Space>
             {status.current?.length ? (
               <Paragraph style={{ marginTop: 16, marginBottom: 0 }}>
@@ -247,43 +387,46 @@ const DashboardPage: React.FC = () => {
             ) : null}
           </Card>
         </Col>
-        <Col xs={24} md={8}>
-          <Card className="glass-card" title="How to run">
-            <Paragraph style={{ marginBottom: 8 }}>
-              <CloudDownloadOutlined /> <Text code>python3 tools/fdroid_download.py -n 100 -o apks</Text>
-            </Paragraph>
-            <Paragraph style={{ marginBottom: 8 }}>
-              <ThunderboltOutlined /> <Text code>python3 tools/batch_scan.py -d apks -t 4 -o results</Text>
-            </Paragraph>
-            <Paragraph style={{ marginBottom: 0 }}>
-              <SecurityScanOutlined /> <Text code>python3 tools/dashboard_server.py</Text>
-            </Paragraph>
-          </Card>
-        </Col>
       </Row>
 
-      <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
-        {[
-          { title: 'Findings', value: status.counts.findings, icon: <SecurityScanOutlined />, color: '#0f172a' },
-          { title: 'Critical', value: status.counts.critical, icon: <CloseCircleOutlined />, color: '#ef4444' },
-          { title: 'AWS hits', value: status.counts.has_aws, icon: <ApiOutlined />, color: '#f59e0b' },
-          { title: 'SendGrid', value: status.counts.has_sendgrid, icon: <ApiOutlined />, color: '#06b6d4' },
-          { title: 'Stripe', value: status.counts.has_stripe, icon: <ApiOutlined />, color: '#8b5cf6' },
-          { title: 'High', value: status.counts.high, icon: <CheckCircleOutlined />, color: '#10b981' },
-        ].map((item) => (
-          <Col xs={12} md={4} key={item.title}>
-            <Card className="glass-card" styles={{ body: { padding: 16 } }}>
-              <Space direction="vertical" size={0}>
-                <Text type="secondary">
-                  {item.icon} {item.title}
-                </Text>
-                <Title level={3} style={{ margin: 0, color: item.color }}>
-                  {item.value}
-                </Title>
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <SecurityScanOutlined /> Results (raw)
+                <Tag>{resultsLines.length}</Tag>
               </Space>
-            </Card>
-          </Col>
-        ))}
+            }
+            extra={
+              <Button icon={<DownloadOutlined />} onClick={onExportTxt}>
+                Export to TXT
+              </Button>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              AWS shown as <Text code>AwsKey:AwsSecretKey</Text>. Other hits are raw secret/API values only.
+            </Paragraph>
+            <div
+              style={{
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                fontSize: 12,
+                lineHeight: 1.7,
+                maxHeight: 320,
+                overflow: 'auto',
+                background: '#0f172a',
+                color: '#e2e8f0',
+                padding: 16,
+                borderRadius: 8,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
+              }}
+            >
+              {resultsLines.length ? resultsLines.join('\n') : <Text type="secondary">No secrets found yet.</Text>}
+            </div>
+          </Card>
+        </Col>
       </Row>
 
       <Row gutter={[16, 16]}>
@@ -302,7 +445,10 @@ const DashboardPage: React.FC = () => {
           <Card className="glass-card" title="Logs" styles={{ body: { maxHeight: 420, overflow: 'auto', background: '#0f172a' } }}>
             <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, lineHeight: 1.7 }}>
               {(status.logs || []).slice(-80).map((line, idx) => (
-                <div key={`${line.ts}-${idx}`} style={{ color: line.level === 'error' ? '#fca5a5' : line.level === 'warning' ? '#fcd34d' : '#cbd5e1' }}>
+                <div
+                  key={`${line.ts}-${idx}`}
+                  style={{ color: line.level === 'error' ? '#fca5a5' : line.level === 'warning' ? '#fcd34d' : '#cbd5e1' }}
+                >
                   <span style={{ color: '#64748b' }}>[{new Date(line.ts).toLocaleTimeString()}]</span>{' '}
                   <span style={{ color: line.level === 'error' ? '#f87171' : '#38bdf8' }}>{line.level.toUpperCase()}</span>{' '}
                   {line.message}

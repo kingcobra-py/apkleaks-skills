@@ -18,11 +18,16 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+TOOLS = ROOT / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
 
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
     tqdm = None
+
+from results_format import aggregate_results, normalize_job_findings  # noqa: E402
 
 
 LOG = logging.getLogger("batch_scan")
@@ -78,6 +83,8 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
         "current": [],
         "jobs": [],
         "logs": [],
+        "raw_lines": [],
+        "aws_pairs": [],
     }
 
 
@@ -120,8 +127,10 @@ def _scan_one(apk: Path, severity: str | None, pattern: str | None, jadx_args: s
     result = cli.cmd_scan(args)
     duration_ms = int((time.time() - started) * 1000)
     data = (result or {}).get("data") or {}
-    findings = data.get("findings") or []
+    # cmd_scan returns classified "results"; older code wrongly looked for "findings"
+    findings = data.get("findings") or data.get("results") or []
     hits = _interesting_hits(findings)
+    norm = normalize_job_findings({"findings": findings})
     return {
         "apk": apk.name,
         "path": str(apk),
@@ -130,8 +139,10 @@ def _scan_one(apk: Path, severity: str | None, pattern: str | None, jadx_args: s
         "error_code": (result or {}).get("error_code"),
         "duration_ms": duration_ms,
         "has_critical": bool(data.get("has_critical")),
-        "finding_count": len(findings),
+        "finding_count": norm["finding_count"],
         "findings": findings,
+        "raw_lines": norm["raw_lines"],
+        "aws_pairs": norm["aws_pairs"],
         "hits": hits,
     }
 
@@ -194,12 +205,24 @@ def run_batch(
                 if sev in ("critical", "high"):
                     status["counts"][sev] = status["counts"].get(sev, 0) + 1
             hits = job.get("hits") or {}
-            if hits.get("aws"):
+            if hits.get("aws") or job.get("aws_pairs"):
                 status["counts"]["has_aws"] += 1
             if hits.get("sendgrid"):
                 status["counts"]["has_sendgrid"] += 1
             if hits.get("stripe"):
                 status["counts"]["has_stripe"] += 1
+            for line in job.get("raw_lines") or []:
+                if line not in status["raw_lines"]:
+                    status["raw_lines"].append(line)
+            for pair in job.get("aws_pairs") or []:
+                if pair not in status["aws_pairs"]:
+                    status["aws_pairs"].append(pair)
+            # Keep a live exportable text file next to status.json
+            export_path = status_file.parent / "results.txt"
+            export_path.write_text(
+                "\n".join(status["raw_lines"]) + ("\n" if status["raw_lines"] else ""),
+                encoding="utf-8",
+            )
             level = "info" if job["ok"] else "error"
             msg = (
                 f"Done {job['apk']}: findings={job.get('finding_count', 0)} "
@@ -224,6 +247,8 @@ def run_batch(
                 "has_critical": False,
                 "finding_count": 0,
                 "findings": [],
+                "raw_lines": [],
+                "aws_pairs": [],
                 "hits": {"aws": False, "sendgrid": False, "stripe": False},
             }
 
@@ -247,6 +272,10 @@ def run_batch(
 
     status["state"] = "completed"
     status["finished_at"] = _utc_now()
+    agg = aggregate_results(status["jobs"])
+    status["raw_lines"] = agg["lines"]
+    status["aws_pairs"] = agg["aws_pairs"]
+    (output_dir / "results.txt").write_text(agg["text"], encoding="utf-8")
     _append_log(status, "info", "Batch scan completed")
     _write_status(status_file, status)
     (output_dir / "summary.json").write_text(json.dumps(status, indent=2), encoding="utf-8")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick unit checks for new AWS secret pattern + batch helpers."""
+"""Quick unit checks for AWS secret pattern + batch helpers + results formatting."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from batch_scan import discover_apks, _interesting_hits  # noqa: E402
+from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
 
 class AwsSecretPatternTests(unittest.TestCase):
@@ -54,6 +55,56 @@ class BatchHelperTests(unittest.TestCase):
         self.assertTrue(hits["aws"])
         self.assertTrue(hits["sendgrid"])
         self.assertTrue(hits["stripe"])
+
+
+class ResultsFormatTests(unittest.TestCase):
+    def test_aws_pair_format(self):
+        job = {
+            "apk": "demo.apk",
+            "findings": [
+                {
+                    "name": "Amazon_AWS_Access_Key_ID",
+                    "severity": "critical",
+                    "matches": ["AKIAIOSFODNN7EXAMPLE"],
+                },
+                {
+                    "name": "AWS_Secret_Access_Key",
+                    "severity": "critical",
+                    "matches": [
+                        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                    ],
+                },
+                {
+                    "name": "Stripe_API_Key",
+                    "severity": "critical",
+                    "matches": ["example_payment_token_not_real"],
+                },
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertEqual(
+            norm["aws_pairs"],
+            ["AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+        )
+        self.assertIn("example_payment_token_not_real", norm["raw_other"])
+        self.assertEqual(norm["raw_lines"][0], norm["aws_pairs"][0])
+
+    def test_aggregate_dedupes(self):
+        jobs = [
+            {
+                "apk": "a.apk",
+                "raw_lines": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
+                "aws_pairs": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
+            },
+            {
+                "apk": "b.apk",
+                "raw_lines": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre", "tok_abc"],
+                "aws_pairs": ["AKIAEXAMPLE:secretsecretsecretsecretsecretsecre"],
+            },
+        ]
+        agg = aggregate_results(jobs)
+        self.assertEqual(agg["total"], 2)
+        self.assertEqual(len(agg["aws_pairs"]), 1)
 
 
 if __name__ == "__main__":

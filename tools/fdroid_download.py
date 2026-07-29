@@ -40,9 +40,15 @@ def load_index() -> dict:
             return json.load(fh)
 
 
-def select_packages(index: dict, count: int, seed: int | None = None) -> list[dict]:
+def select_packages(
+    index: dict,
+    count: int,
+    seed: int | None = None,
+    exclude_names: set[str] | None = None,
+) -> list[dict]:
     apps = index.get("apps") or []
     packages = index.get("packages") or {}
+    exclude = exclude_names or set()
     candidates = []
     for app in apps:
         pkg = app.get("packageName")
@@ -54,7 +60,7 @@ def select_packages(index: dict, count: int, seed: int | None = None) -> list[di
         # Prefer the first listed package version (usually newest in index-v1).
         ver = versions[0]
         apk_name = ver.get("apkName")
-        if not apk_name:
+        if not apk_name or apk_name in exclude:
             continue
         candidates.append({
             "packageName": pkg,
@@ -86,15 +92,25 @@ def download_apk(meta: dict, out_dir: Path, overwrite: bool = False) -> Path:
     return target
 
 
+def existing_apk_names(out_dir: Path) -> set[str]:
+    if not out_dir.is_dir():
+        return set()
+    return {p.name for p in out_dir.glob("*.apk") if p.is_file()}
+
+
 def run(count: int, out_dir: Path, seed: int | None = None, overwrite: bool = False) -> dict:
     index = load_index()
-    selected = select_packages(index, count, seed=seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Skip duplicates: only select APKs not already on disk (unless overwrite)
+    exclude = set() if overwrite else existing_apk_names(out_dir)
+    selected = select_packages(index, count, seed=seed, exclude_names=exclude)
     results = []
+    skipped_existing = len(exclude)
     iterator = tqdm(selected, desc="Downloading APKs", unit="apk") if tqdm else selected
     for meta in iterator:
         try:
             path = download_apk(meta, out_dir, overwrite=overwrite)
-            results.append({**meta, "ok": True, "path": str(path)})
+            results.append({**meta, "ok": True, "path": str(path), "skipped_duplicate": False})
         except (HTTPError, URLError, OSError, TimeoutError) as exc:
             LOG.error("Failed %s: %s", meta["packageName"], exc)
             results.append({**meta, "ok": False, "error": str(exc)})
@@ -105,6 +121,7 @@ def run(count: int, out_dir: Path, seed: int | None = None, overwrite: bool = Fa
         "selected": len(selected),
         "downloaded": sum(1 for r in results if r.get("ok")),
         "failed": sum(1 for r in results if not r.get("ok")),
+        "skipped_existing": skipped_existing,
         "output_dir": str(out_dir),
         "apps": results,
     }
