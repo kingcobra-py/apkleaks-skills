@@ -311,22 +311,33 @@ def stop_download() -> dict:
     global _DOWNLOAD_PROC
     with _STATE_LOCK:
         proc = _DOWNLOAD_PROC
-    if proc is None or proc.poll() is not None:
-        return {"ok": True, "message": "No download running"}
-    try:
-        os.killpg(os.getpgid(proc.pid), 15)
-    except OSError:
+        _DOWNLOAD_PROC = None
+    if proc is not None and proc.poll() is None:
         try:
-            proc.terminate()
+            os.killpg(os.getpgid(proc.pid), 15)
         except OSError:
-            pass
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except OSError:
+                pass
     try:
-        proc.wait(timeout=8)
+        subprocess.run(["pkill", "-f", "tools/fdroid_download.py"], check=False, timeout=5)
     except Exception:  # noqa: BLE001
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        pass
+    _write_download_status({
+        "ok": True,
+        "state": "stopped",
+        "finished_at": _utc_now(),
+        "message": "Download stopped",
+    })
+    _SYSTEM_CACHE["built_at"] = 0.0
     return {"ok": True, "message": "Download stopped"}
 
 
@@ -334,6 +345,7 @@ def stop_scan() -> dict:
     global _SCAN_PROC
     with _STATE_LOCK:
         proc = _SCAN_PROC
+        _SCAN_PROC = None
     # Prefer tracked proc, but also kill orphan batch_scan children.
     if proc is not None and proc.poll() is None:
         try:
@@ -344,7 +356,7 @@ def stop_scan() -> dict:
             except OSError:
                 pass
         try:
-            proc.wait(timeout=8)
+            proc.wait(timeout=5)
         except Exception:  # noqa: BLE001
             try:
                 proc.kill()
@@ -354,6 +366,7 @@ def stop_scan() -> dict:
         subprocess.run(["pkill", "-f", "tools/batch_scan.py"], check=False, timeout=5)
     except Exception:  # noqa: BLE001
         pass
+    _SYSTEM_CACHE["built_at"] = 0.0
     return {"ok": True, "message": "Scan stopped"}
 
 
@@ -642,23 +655,27 @@ def start_loop(
 def stop_loop() -> dict:
     save_config({"loop_enabled": False})
     _LOOP_STOP.set()
-    # Do not kill an in-flight scan/download immediately — let the current
-    # phase finish unless the user separately stops them. Mark status stopped.
+    # Stop immediately — kill in-flight download + scan started by the loop.
+    dl = stop_download()
+    sc = stop_scan()
     _write_loop_status({
-        **load_loop_status(),
         "ok": True,
         "enabled": False,
         "running": False,
-        "state": "stopping",
-        "phase": "stopping",
-        "message": "Stop requested — finishing current phase",
+        "state": "stopped",
+        "phase": "idle",
+        "cycle": int(load_loop_status().get("cycle") or 0),
+        "message": "Loop stopped (download and scan halted)",
         "updated_at": _utc_now(),
     })
+    _SYSTEM_CACHE["built_at"] = 0.0
     return {
         "ok": True,
-        "state": "stopping",
+        "state": "stopped",
+        "download": dl,
+        "scan": sc,
         "loop": load_loop_status(),
-        "message": "Loop stop requested",
+        "message": "Loop stopped — download and scan halted",
     }
 
 

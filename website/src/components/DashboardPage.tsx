@@ -710,6 +710,7 @@ const DashboardPage: React.FC = () => {
               >
                 Stop loop
               </Button>
+              <Text type="secondary">Stop also kills the current download/scan right away.</Text>
               <Tag color={loop?.phase === 'scanning' ? 'cyan' : loop?.phase === 'downloading' ? 'blue' : 'default'}>
                 phase: {loop?.phase || 'idle'}
               </Tag>
