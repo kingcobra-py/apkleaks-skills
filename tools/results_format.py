@@ -164,6 +164,19 @@ def _classify_priority_value(name: str, match: str) -> tuple[str | None, str | N
     return None, None
 
 
+def format_other_line(name: str, value: str) -> str:
+    """Label other-API hits so the dashboard shows what pattern matched."""
+    label = (name or "Unknown").strip() or "Unknown"
+    return f"{label}: {value}"
+
+
+def _other_value_part(line: str) -> str:
+    """Extract raw value from `Name: value` (or return line as-is)."""
+    if ": " in line:
+        return line.split(": ", 1)[1]
+    return line
+
+
 def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
     """Return priority/other secret lists from a batch job or CLI data blob."""
     findings = job.get("findings") or job.get("results") or []
@@ -207,7 +220,8 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
                 _add(priority, cleaned2)
                 continue
             if not is_noise_value(match):
-                _add(other, match)
+                label = name or "Unknown_API"
+                _add(other, format_other_line(label, match))
 
     aws_pairs: list[str] = []
     if aws_keys and aws_secrets:
@@ -219,13 +233,24 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
                     _add(priority, pair)
     elif aws_keys:
         for key in aws_keys:
-            _add(other, key)
+            _add(other, format_other_line("Amazon_AWS_Access_Key_ID", key))
     elif aws_secrets:
         for secret in aws_secrets:
-            _add(other, secret)
+            _add(other, format_other_line("AWS_Secret_Access_Key", secret))
 
     priority = [x for x in priority if not is_noise_value(x) or ":" in x]
-    other = [x for x in other if not is_noise_value(x) and x not in priority]
+    # Drop other lines whose raw value is noise, or that duplicate a priority value
+    priority_values = set(priority)
+    cleaned_other: list[str] = []
+    for line in other:
+        raw = _other_value_part(line)
+        if is_noise_value(raw):
+            continue
+        if raw in priority_values or line in priority_values:
+            continue
+        if line not in cleaned_other:
+            cleaned_other.append(line)
+    other = cleaned_other
     lines = list(priority) + list(other)
     return {
         "raw_lines": lines,
@@ -256,12 +281,22 @@ def _split_precomputed_lines(lines: list[str], pairs: list[str]) -> dict[str, An
     for line in list(pairs) + list(lines):
         if not line:
             continue
-        if is_noise_value(line) and not _is_priority_line(line):
+        raw = _other_value_part(line)
+        # Priority detection on unlabeled or labeled lines
+        if _is_priority_line(line) or _is_priority_line(raw):
+            target = raw if _is_priority_line(raw) and not _is_priority_line(line) else line
+            # Prefer unlabeled priority value for AWS/SG/sk_live boxes
+            if _is_priority_line(raw):
+                target = raw
+            if is_noise_value(raw) and not _is_priority_line(raw):
+                continue
+            if target not in priority:
+                priority.append(target)
             continue
-        if _is_priority_line(line):
-            if line not in priority:
-                priority.append(line)
-        elif line not in other and line not in priority:
+        if is_noise_value(raw):
+            continue
+        # Keep/upgrade to Name: value when possible
+        if line not in other and raw not in {_other_value_part(x) for x in other}:
             other.append(line)
     return {
         "priority_lines": priority,

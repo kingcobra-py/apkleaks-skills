@@ -557,7 +557,7 @@ const DashboardPage: React.FC = () => {
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              Any other API keys / tokens found (raw values only).
+              Other hits as <Text code>PatternName: value</Text> so you can see what matched.
             </Paragraph>
             <div style={monoBoxStyle}>
               {otherLines.length ? otherLines.join('\n') : <Text type="secondary">No other API secrets yet.</Text>}

@@ -87,7 +87,10 @@ class ResultsFormatTests(unittest.TestCase):
             ["AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
         )
         self.assertIn(norm["aws_pairs"][0], norm["priority_lines"])
-        self.assertIn("example_other_api_token_value_123456", norm["other_lines"])
+        self.assertIn(
+            "Generic_API_Key: example_other_api_token_value_123456",
+            norm["other_lines"],
+        )
 
     def test_priority_sendgrid_and_sk_live(self):
         sg = "SG." + ("A" * 22) + "." + ("B" * 43)
@@ -105,7 +108,7 @@ class ResultsFormatTests(unittest.TestCase):
         norm = normalize_job_findings(job)
         self.assertIn(sg, norm["priority_lines"])
         self.assertIn(sk, norm["priority_lines"])
-        self.assertIn(twilio, norm["other_lines"])
+        self.assertIn(f"Twilio_API_Key: {twilio}", norm["other_lines"])
 
     def test_filters_common_false_positives(self):
         job = {
@@ -123,7 +126,10 @@ class ResultsFormatTests(unittest.TestCase):
         self.assertNotIn("ads.s3.amazonaws.com", norm["raw_lines"])
         self.assertNotIn("basic whitelist", norm["raw_lines"])
         self.assertNotIn("androidGradlePluginVersion=8.5.1", norm["raw_lines"])
-        self.assertIn("example_mail_api_token_value_123456", norm["other_lines"])
+        self.assertIn(
+            "Generic_API_Key: example_mail_api_token_value_123456",
+            norm["other_lines"],
+        )
 
     def test_aggregate_dedupes(self):
         pair = "AKIAIOSFODNN7EXAMPLE:secretsecretsecretsecretsecretsecre"
