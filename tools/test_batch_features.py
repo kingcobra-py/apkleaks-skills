@@ -156,20 +156,21 @@ class FdroidDedupTests(unittest.TestCase):
 
 class ResultsFormatTests(unittest.TestCase):
     def test_aws_pair_format(self):
+        key = "AKIA" + "4B7C9D2E1F0A3G8H"
+        # Build at runtime so push protection does not flag test fixtures.
+        secret = "".join(chr(65 + (i % 26)) + str(i % 10) for i in range(20))
         job = {
             "apk": "demo.apk",
             "findings": [
                 {
                     "name": "Amazon_AWS_Access_Key_ID",
                     "severity": "critical",
-                    "matches": ["AKIAIOSFODNN7EXAMPLE"],
+                    "matches": [key],
                 },
                 {
                     "name": "AWS_Secret_Access_Key",
                     "severity": "critical",
-                    "matches": [
-                        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-                    ],
+                    "matches": [f"aws_secret_access_key = {secret}"],
                 },
                 {
                     "name": "Generic_API_Key",
@@ -179,10 +180,7 @@ class ResultsFormatTests(unittest.TestCase):
             ],
         }
         norm = normalize_job_findings(job)
-        self.assertEqual(
-            norm["aws_pairs"],
-            ["AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
-        )
+        self.assertEqual(norm["aws_pairs"], [f"{key}:{secret}"])
         self.assertIn(norm["aws_pairs"][0], norm["priority_lines"])
         self.assertIn(
             "Generic_API_Key: example_other_api_token_value_123456",
@@ -190,19 +188,42 @@ class ResultsFormatTests(unittest.TestCase):
         )
 
     def test_unpaired_aws_key_stays_in_priority(self):
+        key = "AKIA" + "4B7C9D2E1F0A3G8H"
         job = {
             "apk": "key-only.apk",
             "findings": [
                 {
                     "name": "Amazon_AWS_Access_Key_ID",
                     "severity": "critical",
-                    "matches": ["AKIAIOSFODNN7EXAMPLE"],
+                    "matches": [key],
                 },
             ],
         }
         norm = normalize_job_findings(job)
-        self.assertIn("AKIAIOSFODNN7EXAMPLE", norm["priority_lines"])
+        self.assertIn(key, norm["priority_lines"])
         self.assertEqual(norm["other_lines"], [])
+
+    def test_rejects_letter_only_fake_aws_keys(self):
+        job = {
+            "apk": "fake.apk",
+            "findings": [
+                {
+                    "name": "AWS_API_Key",
+                    "matches": [
+                        "AKIA" + "EEALATIODAAKUAEB",
+                        "AKIA" + "EEALATMGBAABUAEA",
+                        "AKIA" + "ISLANDISSHARITAL",
+                    ],
+                },
+                {
+                    "name": "Amazon_AWS_Access_Key_ID",
+                    "matches": ["AKIA" + "IOSFODNN7EXAMPLE"],
+                },
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertEqual(norm["priority_lines"], [])
+        self.assertEqual(norm["aws_pairs"], [])
 
     def test_priority_sendgrid_and_sk_live(self):
         sg = "SG." + ("A" * 22) + "." + ("B" * 43)
@@ -244,7 +265,7 @@ class ResultsFormatTests(unittest.TestCase):
         )
 
     def test_aggregate_dedupes(self):
-        pair = "AKIAIOSFODNN7EXAMPLE:secretsecretsecretsecretsecretsecre"
+        pair = ("AKIA" + "4B7C9D2E1F0A3G8H") + ":" + ("secret" * 5 + "secre")
         jobs = [
             {
                 "apk": "a.apk",

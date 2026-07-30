@@ -42,11 +42,15 @@ NOISE_FINDING_NAMES = {
     "IPv6",
 }
 
-_AKIA_RE = re.compile(r"(?:^|[^A-Z0-9])((?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|A3T)[A-Z0-9]{16})")
+_AKIA_RE = re.compile(
+    r"(?:^|[^A-Z0-9])((?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|A3T)[A-Z0-9]{16})(?![A-Z0-9])"
+)
+_AKIA_FULL_RE = re.compile(r"^(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|A3T)[A-Z0-9]{16}$")
 _SECRET_RE = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{40})(?![A-Za-z0-9+/=])")
 _SENDGRID_RE = re.compile(r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b")
 _SK_LIVE_RE = re.compile(r"\bsk_live_[0-9a-zA-Z]{20,}\b")
 _RK_LIVE_RE = re.compile(r"\brk_live_[0-9a-zA-Z]{20,}\b")
+_AWS_EXAMPLE_MARKERS = ("EXAMPLE", "TESTKEY", "FAKESECRET", "DUMMY", "CHANGEME")
 
 _S3_HOST_RE = re.compile(
     r"(?i)(?:^|[\s\"'])(?:[a-z0-9.-]+\.)?s3[.-][a-z0-9.-]*amazonaws\.com|"
@@ -76,12 +80,29 @@ def _extract_matches(finding: dict[str, Any]) -> list[str]:
     return out
 
 
+def is_plausible_aws_access_key(key: str) -> bool:
+    """Reject English/placeholder strings that only look like AKIA… tokens."""
+    if not key or not _AKIA_FULL_RE.fullmatch(key):
+        return False
+    upper = key.upper()
+    if any(marker in upper for marker in _AWS_EXAMPLE_MARKERS):
+        return False
+    # Real AWS access key IDs always include digits; letter-only hits are usually words.
+    if not re.search(r"\d", key):
+        return False
+    # Too little variety (AKIA0000… / AKIAAAAA…)
+    if len(set(key[4:])) < 6:
+        return False
+    return True
+
+
 def _clean_aws_key(raw: str) -> str | None:
     m2 = _AKIA_RE.search(raw)
     if m2:
-        return m2.group(1).strip()
+        key = m2.group(1).strip()
+        return key if is_plausible_aws_access_key(key) else None
     token = re.sub(r"[^A-Za-z0-9]", "", raw)
-    if re.fullmatch(r"(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA|A3T)[A-Z0-9]{16}", token):
+    if _AKIA_FULL_RE.fullmatch(token) and is_plausible_aws_access_key(token):
         return token
     return None
 
@@ -91,15 +112,23 @@ def _clean_aws_secret(raw: str) -> str | None:
         r"(?i)aws[_-]?secret[_-]?(?:access[_-]?)?key\s*[=:]\s*['\"]?([A-Za-z0-9+/]{40})['\"]?",
         raw,
     )
+    secret: str | None = None
     if m:
-        return m.group(1)
-    m2 = _SECRET_RE.search(raw)
-    if m2:
-        return m2.group(1)
-    token = raw.strip().strip("'\"").strip()
-    if re.fullmatch(r"[A-Za-z0-9+/]{40}", token):
-        return token
-    return None
+        secret = m.group(1)
+    else:
+        m2 = _SECRET_RE.search(raw)
+        if m2:
+            secret = m2.group(1)
+        else:
+            token = raw.strip().strip("'\"").strip()
+            if re.fullmatch(r"[A-Za-z0-9+/]{40}", token):
+                secret = token
+    if not secret:
+        return None
+    upper = secret.upper()
+    if any(marker in upper for marker in _AWS_EXAMPLE_MARKERS):
+        return None
+    return secret
 
 
 def _extract_sendgrid(raw: str) -> str | None:
@@ -133,8 +162,12 @@ def is_noise_value(value: str) -> bool:
     # Structured high-signal formats — skip entropy heuristics.
     if _SENDGRID_RE.fullmatch(v) or _SK_LIVE_RE.fullmatch(v) or _RK_LIVE_RE.fullmatch(v):
         return False
-    if _AKIA_RE.search(v):
-        return False
+    stripped = v.strip()
+    if _AKIA_FULL_RE.fullmatch(stripped):
+        return not is_plausible_aws_access_key(stripped)
+    m_akia = _AKIA_RE.search(v)
+    if m_akia:
+        return not is_plausible_aws_access_key(m_akia.group(1))
     if _is_low_entropy_token(v):
         return True
     return False
@@ -310,7 +343,7 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
         for secret in aws_secrets:
             _add(priority, secret)
 
-    priority = [x for x in priority if not is_noise_value(x) or ":" in x]
+    priority = [x for x in priority if keep_priority_line(x)]
     # Drop other lines whose raw value is noise, or that duplicate a priority value
     priority_values = set(priority)
     cleaned_other: list[str] = []
@@ -343,8 +376,29 @@ def _is_priority_line(line: str) -> bool:
     if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
         return True
     if ":" in line and _AKIA_RE.search(line):
-        return True
+        key = line.split(":", 1)[0].strip()
+        return is_plausible_aws_access_key(key)
+    if _AKIA_FULL_RE.fullmatch(line.strip()):
+        return is_plausible_aws_access_key(line.strip())
     return False
+
+
+def keep_priority_line(line: str) -> bool:
+    """Drop placeholder / letter-only AWS leftovers from Priority."""
+    if not line:
+        return False
+    if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
+        return not is_noise_value(line)
+    if ":" in line and _AKIA_RE.search(line.split(":", 1)[0]):
+        key, secret = line.split(":", 1)
+        return is_plausible_aws_access_key(key.strip()) and bool(secret.strip()) and not any(
+            m in secret.upper() for m in _AWS_EXAMPLE_MARKERS
+        )
+    if _AKIA_FULL_RE.fullmatch(line.strip()):
+        return is_plausible_aws_access_key(line.strip())
+    if re.fullmatch(r"[A-Za-z0-9+/]{40}", line.strip()):
+        return not any(m in line.upper() for m in _AWS_EXAMPLE_MARKERS)
+    return True
 
 
 def _split_precomputed_lines(lines: list[str], pairs: list[str]) -> dict[str, Any]:
@@ -360,6 +414,8 @@ def _split_precomputed_lines(lines: list[str], pairs: list[str]) -> dict[str, An
             # Prefer unlabeled priority value for AWS/SG/sk_live boxes
             if _is_priority_line(raw):
                 target = raw
+            if not keep_priority_line(target):
+                continue
             if is_noise_value(raw) and not _is_priority_line(raw):
                 continue
             if target not in priority:
@@ -414,9 +470,15 @@ def aggregate_results(jobs: list[dict[str, Any]]) -> dict[str, Any]:
                         continue
                     cleaned_other.append(x)
                 norm = {
-                    "priority_lines": [x for x in (job.get("priority_lines") or []) if x],
+                    "priority_lines": [
+                        x for x in (job.get("priority_lines") or []) if x and keep_priority_line(x)
+                    ],
                     "other_lines": cleaned_other,
-                    "aws_pairs": job.get("aws_pairs") or [],
+                    "aws_pairs": [
+                        x
+                        for x in (job.get("aws_pairs") or [])
+                        if x and keep_priority_line(x)
+                    ],
                     "raw_lines": [],
                     "sendgrid": [],
                     "sk_live": [],
