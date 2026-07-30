@@ -365,5 +365,28 @@ class ResultsFormatTests(unittest.TestCase):
         # May still fail length - ensure mixed case+digit path exists
         self.assertTrue(looks_like_secret("Buildkite_API_Token", "bkAa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn"))
 
+    def test_rejects_decompiler_password_and_fake_nuget(self):
+        from results_format import normalize_job_findings
+
+        job = {
+            "apk": "junk.apk",
+            "findings": [
+                {
+                    "name": "Generic_Password",
+                    "matches": [
+                        'password: ");\n        sb.append(accessibilityNodeInfo.isPassword());\n        sb.append("'
+                    ],
+                },
+                {
+                    "name": "NuGet_API_Key",
+                    "matches": ["oy2d1isyd5remye6dreye4lenye6letyel4skyels3my7e"],
+                },
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertEqual(norm["priority_lines"], [])
+        self.assertEqual(norm["other_lines"], [])
+        self.assertEqual(norm["finding_count"], 0)
+
 if __name__ == "__main__":
     unittest.main()

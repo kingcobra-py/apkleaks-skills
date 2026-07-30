@@ -159,6 +159,19 @@ def is_noise_value(value: str) -> bool:
     if v.count(".") >= 2 and not _JWT_RE.match(v):
         if "Gradle" in v or "version" in v.lower():
             return True
+    low = v.lower()
+    # Decompiler / Android framework false positives for Generic_Password etc.
+    junk_snippets = (
+        "accessibilitynodeinfo",
+        "ispassword()",
+        "toindentedstring",
+        "sb.append(",
+        "passwordcertainty",
+        "-----begin ",
+        "changeit",
+    )
+    if any(s in low for s in junk_snippets):
+        return True
     # Structured high-signal formats — skip entropy heuristics.
     if _SENDGRID_RE.fullmatch(v) or _SK_LIVE_RE.fullmatch(v) or _RK_LIVE_RE.fullmatch(v):
         return False
@@ -178,8 +191,10 @@ def _is_low_entropy_token(value: str) -> bool:
     v = value.strip().strip("'\"")
     # Strip common prefixes for entropy check
     body = v
+    stripped_prefix = ""
     for prefix in ("bk", "oy2", "SG.", "AC", "SK", "AKIA"):
         if body.startswith(prefix):
+            stripped_prefix = prefix
             body = body[len(prefix) :]
             break
     if len(body) < 12:
@@ -196,6 +211,11 @@ def _is_low_entropy_token(value: str) -> bool:
     # Very few unique chars overall
     if len(counts) <= max(4, len(body) // 10):
         return True
+    # Prefixed tokens (bk… / oy2…) that are mostly lowercase syllables
+    if stripped_prefix in {"bk", "oy2"} and re.fullmatch(r"[a-z0-9_-]+", body) and body.islower():
+        digit_ratio = sum(ch.isdigit() for ch in body) / max(1, len(body))
+        if digit_ratio < 0.12:
+            return True
     # Obvious source/identifier noise
     noise_bits = (
         "file_text",
@@ -207,6 +227,10 @@ def _is_low_entropy_token(value: str) -> bool:
         "jwk_",
         "Qab",
         "lsbls",
+        "remye",
+        "dreye",
+        "lenye",
+        "letye",
     )
     low = v.lower()
     if any(b.lower() in low for b in noise_bits):
@@ -220,6 +244,15 @@ def looks_like_secret(name: str, value: str) -> bool:
         return False
     if is_noise_value(value):
         return False
+    if name == "Generic_Password":
+        # Require a short assignment-like secret, not source dumps.
+        if "\n" in value or len(value) > 80:
+            return False
+        if not re.search(r"(?i)password\s*[:=]\s*\S+", value):
+            return False
+        # Reject values that are clearly code fragments.
+        if any(tok in value for tok in ("(", ")", ";", "append", "String")):
+            return False
     if name == "Buildkite_API_Token":
         # Real tokens aren't pure lowercase runs / repeated Qab fragments.
         body = value[2:] if value.startswith("bk") else value
@@ -241,12 +274,23 @@ def looks_like_secret(name: str, value: str) -> bool:
     if name == "NuGet_API_Key":
         if not re.fullmatch(r"oy2[a-zA-Z0-9_-]{43}", value):
             return False
-        if value[3:].islower() and not re.search(r"[0-9]", value):
+        body = value[3:]
+        if body.islower() and not re.search(r"[0-9]", body):
             return False
+        # Reject dictionary-syllable mash (almost no uppercase / few digits).
+        if body.islower() and sum(ch.isdigit() for ch in body) < 4:
+            return False
+        if not re.search(r"[A-Z]", body):
+            # Allow digit-heavy lowercase keys only.
+            if sum(ch.isdigit() for ch in body) < 8:
+                return False
     if name == "JSON_Web_Token":
         return bool(_JWT_RE.match(value)) and value.startswith("eyJ")
     if name == "Authorization_Bearer":
         return bool(re.search(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*", value)) and len(value) >= 20
+    if name in {"RSA_Private_Key", "SSH_DSA_Private_Key", "SSH_EC_Private_Key", "Private_Key_Generic"}:
+        # PEM headers alone are not useful exports.
+        return False
     if len(value) < 12:
         return False
     if " " in value and not re.search(r"[A-Za-z0-9_\-]{16,}", value):

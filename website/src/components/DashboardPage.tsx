@@ -45,6 +45,8 @@ type Job = {
   hits?: { aws?: boolean; sendgrid?: boolean; stripe?: boolean };
   error?: string;
   raw_lines?: string[];
+  priority_lines?: string[];
+  other_lines?: string[];
   aws_pairs?: string[];
 };
 type Config = {
@@ -498,9 +500,21 @@ const DashboardPage: React.FC = () => {
       },
       {
         title: 'Secrets',
-        dataIndex: 'finding_count',
-        key: 'finding_count',
-        width: 90,
+        key: 'secrets',
+        width: 120,
+        render: (_: unknown, row: Job) => {
+          const total = row.finding_count ?? 0;
+          const pri = (row.priority_lines || []).length;
+          const other = (row.other_lines || []).length || Math.max(0, total - pri);
+          if (!total) return '—';
+          return (
+            <Space size={4} wrap>
+              {pri ? <Tag color="orange">P {pri}</Tag> : null}
+              {other ? <Tag>O {other}</Tag> : null}
+              {!pri && !other ? <Tag>{total}</Tag> : null}
+            </Space>
+          );
+        },
       },
       {
         title: 'Duration',
@@ -819,8 +833,8 @@ const DashboardPage: React.FC = () => {
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              AWS as <Text code>AwsKey:AwsSecretKey</Text>, plus SendGrid (<Text code>SG.</Text>) and Stripe{' '}
-              <Text code>sk_live_</Text>.
+              Only AWS <Text code>Key:Secret</Text>, SendGrid (<Text code>SG.</Text>), and Stripe{' '}
+              <Text code>sk_live_</Text>. Job “Secrets” can be higher when hits are Other-only.
             </Paragraph>
             <div style={monoBoxStyle}>
               {priorityLines.length ? priorityLines.join('\n') : <Text type="secondary">No AWS / SendGrid / sk_live hits yet.</Text>}
@@ -843,7 +857,7 @@ const DashboardPage: React.FC = () => {
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              Other hits as <Text code>PatternName: value</Text> so you can see what matched.
+              Unique non-priority hits (newest first). Duplicate values across apps are only listed once.
             </Paragraph>
             <div style={monoBoxStyle}>
               {otherLines.length ? otherLines.join('\n') : <Text type="secondary">No other API secrets yet.</Text>}
@@ -854,7 +868,11 @@ const DashboardPage: React.FC = () => {
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={14}>
-          <Card className="glass-card" title="Recent jobs">
+          <Card
+            className="glass-card"
+            title="Recent jobs"
+            extra={<Text type="secondary">P = Priority · O = Other APIs</Text>}
+          >
             <Table
               size="small"
               rowKey={(r) => r.apk}
