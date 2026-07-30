@@ -450,7 +450,7 @@ def _results_cache_key() -> tuple:
 
 
 def _cached_aggregate(status_jobs: list | None = None, force: bool = False) -> dict:
-    """Aggregate results with a short-lived cache — /api/status was taking 15–25s."""
+    """Aggregate results with a short-lived cache — /api/results was taking 15–25s."""
     key = _results_cache_key()
     now = time.time()
     cached = _RESULTS_CACHE.get("agg")
@@ -458,7 +458,7 @@ def _cached_aggregate(status_jobs: list | None = None, force: bool = False) -> d
         not force
         and cached is not None
         and _RESULTS_CACHE.get("key") == key
-        and (now - float(_RESULTS_CACHE.get("built_at") or 0)) < 8.0
+        and (now - float(_RESULTS_CACHE.get("built_at") or 0)) < 15.0
     ):
         return cached
     jobs = _iter_result_jobs(status_jobs or [])
@@ -467,6 +467,13 @@ def _cached_aggregate(status_jobs: list | None = None, force: bool = False) -> d
     _RESULTS_CACHE["agg"] = agg
     _RESULTS_CACHE["built_at"] = now
     return agg
+
+
+def _warm_results_cache() -> None:
+    try:
+        collect_results(RESULTS_DIR / "status.json")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def load_status(status_path: Path) -> dict:
@@ -782,6 +789,8 @@ def main() -> int:
     system_stats()
 
     StatusHandler.status_path = Path(args.status)
+    # Warm results cache in the background so first UI poll stays snappy.
+    threading.Thread(target=_warm_results_cache, name="warm-results-cache", daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), StatusHandler)
     print(f"Dashboard API listening on http://{args.host}:{args.port}")
     print(f"Status file: {StatusHandler.status_path}")

@@ -10,7 +10,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -110,6 +112,7 @@ _SKIP_DIR_PARTS = (
     "/assets/fonts/",
 )
 _MAX_SCAN_FILE_BYTES = 1_500_000
+_JADX_TIMEOUT_SEC = 240
 
 # Patterns that are expensive and low-value for batch high-severity secret hunting.
 _SKIP_PATTERN_NAMES = {
@@ -373,6 +376,39 @@ def fast_scan_tempdir(
     return results
 
 
+def _decompile_with_timeout(runner: Any, timeout_sec: int = _JADX_TIMEOUT_SEC) -> None:
+    """Run jadx with a hard timeout — upstream os.system() can hang forever."""
+    args = [runner.jadx, runner.file, "-d", runner.tempdir]
+    disarg = getattr(runner, "disarg", None)
+    if disarg:
+        try:
+            args.extend(shlex.split(str(disarg)))
+        except ValueError:
+            args.extend(re.split(r"\s|=", str(disarg)))
+    # Drop empty tokens from naive splits
+    args = [a for a in args if a]
+    LOG.info("jadx timeout=%ss cmd=%s", timeout_sec, " ".join(args[:6]))
+    try:
+        proc = subprocess.run(
+            args,
+            timeout=timeout_sec,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode not in (0, 1):
+            # jadx often returns 1 when some classes fail — still usable output.
+            LOG.warning("jadx exited with code %s for %s", proc.returncode, runner.file)
+    except subprocess.TimeoutExpired as exc:
+        # Ensure hung jadx trees are killed.
+        try:
+            if exc.process is not None:
+                exc.process.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        raise TimeoutError(f"jadx timed out after {timeout_sec}s") from exc
+
+
 def _fast_scanning(
     runner: Any,
     on_progress: Callable[[int, int], None] | None = None,
@@ -474,7 +510,7 @@ def _scan_one(
                 builtins.input = original_input
 
         phase("decompiling", "Decompiling with jadx (this can take a while)")
-        runner.decompile()
+        _decompile_with_timeout(runner)
 
         def on_scan_progress(done: int, total: int) -> None:
             pct = _scan_percent(done, total)
@@ -681,6 +717,17 @@ def run_batch(
         percent: int | None = None,
     ) -> None:
         with _STATUS_LOCK:
+            # Terminal phases should not linger in the live "active" map — otherwise
+            # the UI fills with finished apps when mark_done falls behind or crashes.
+            if phase in ("done", "failed"):
+                status["active"].pop(name, None)
+                if name in status["current"]:
+                    status["current"].remove(name)
+                # Still bump updated_at so the dashboard knows work is moving.
+                status["updated_at"] = _utc_now()
+                _write_status(status_file, status)
+                return
+
             info = status["active"].get(name) or {}
             if "_started_ts" not in info:
                 info["_started_ts"] = time.time()
@@ -702,7 +749,7 @@ def run_batch(
                 }
             )
             status["active"][name] = info
-            if name not in status["current"] and phase not in ("done", "failed"):
+            if name not in status["current"]:
                 status["current"].append(name)
             # Throttle disk writes during dense scanning progress updates.
             changed = (
@@ -710,7 +757,6 @@ def run_batch(
                 or message != prev_msg
                 or prev_pct is None
                 or abs(pct - int(prev_pct)) >= 2
-                or phase in ("done", "failed", "classifying")
                 or (now - last_write) >= 1.5
             )
             if changed:
@@ -734,15 +780,17 @@ def run_batch(
             _write_status(status_file, status)
 
     def mark_done(job: dict[str, Any]) -> None:
+        # Mutate status under the lock, but do NOT hold the lock while writing
+        # large result files — that starved workers and left dozens of APKs
+        # stuck as phase=done in the UI with no further progress.
+        export_payload: dict[str, str] | None = None
         with _STATUS_LOCK:
             name = job["apk"]
             if name in status["current"]:
                 status["current"].remove(name)
-            # Keep finished active entry briefly with final phase, then drop
             status["active"].pop(name, None)
             slim = _slim_job(job)
             status["jobs"].append(slim)
-            # Cap jobs retained in status.json for UI speed
             if len(status["jobs"]) > 300:
                 status["jobs"] = status["jobs"][-300:]
             status["progress"]["completed"] += 1
@@ -768,7 +816,6 @@ def run_batch(
             for line in job.get("priority_lines") or []:
                 if line not in status["priority_lines"]:
                     status["priority_lines"].append(line)
-            # Newest finds first in Other APIs.
             new_other = [
                 line
                 for line in (job.get("other_lines") or [])
@@ -778,24 +825,13 @@ def run_batch(
             ]
             if new_other:
                 status["other_lines"] = new_other + list(status["other_lines"])
+            # Cap exported other lines so status writes stay cheap.
+            if len(status["other_lines"]) > 2000:
+                status["other_lines"] = status["other_lines"][:2000]
             status["raw_lines"] = list(status["priority_lines"]) + list(status["other_lines"])
             for pair in job.get("aws_pairs") or []:
                 if pair not in status["aws_pairs"]:
                     status["aws_pairs"].append(pair)
-            out_dir = status_file.parent
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "results.txt").write_text(
-                "\n".join(status["raw_lines"]) + ("\n" if status["raw_lines"] else ""),
-                encoding="utf-8",
-            )
-            (out_dir / "priority-results.txt").write_text(
-                "\n".join(status["priority_lines"]) + ("\n" if status["priority_lines"] else ""),
-                encoding="utf-8",
-            )
-            (out_dir / "other-results.txt").write_text(
-                "\n".join(status["other_lines"]) + ("\n" if status["other_lines"] else ""),
-                encoding="utf-8",
-            )
             level = "info" if job["ok"] else "error"
             msg = (
                 f"Done {job['apk']}: findings={job.get('finding_count', 0)} "
@@ -803,7 +839,23 @@ def run_batch(
             )
             _append_log(status, level, msg)
             LOG.log(logging.INFO if job["ok"] else logging.ERROR, msg)
+            export_payload = {
+                "raw": "\n".join(status["raw_lines"]) + ("\n" if status["raw_lines"] else ""),
+                "priority": "\n".join(status["priority_lines"])
+                + ("\n" if status["priority_lines"] else ""),
+                "other": "\n".join(status["other_lines"]) + ("\n" if status["other_lines"] else ""),
+            }
             _write_status(status_file, status)
+
+        if export_payload is not None:
+            try:
+                out_dir = status_file.parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / "results.txt").write_text(export_payload["raw"], encoding="utf-8")
+                (out_dir / "priority-results.txt").write_text(export_payload["priority"], encoding="utf-8")
+                (out_dir / "other-results.txt").write_text(export_payload["other"], encoding="utf-8")
+            except OSError as exc:
+                LOG.warning("Failed to write export txt files: %s", exc)
 
     def _worker(apk: Path) -> dict[str, Any]:
         mark_start(apk.name)
@@ -852,9 +904,45 @@ def run_batch(
             futures = {pool.submit(_worker, apk): apk for apk in apks}
             for fut in as_completed(futures):
                 apk = futures[fut]
-                job = fut.result()
-                (output_dir / f"{apk.stem}.json").write_text(json.dumps(job, indent=2), encoding="utf-8")
-                mark_done(job)
+                try:
+                    job = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    job = {
+                        "apk": apk.name,
+                        "path": str(apk),
+                        "ok": False,
+                        "error": str(exc),
+                        "error_code": "SCAN_FAILED",
+                        "duration_ms": 0,
+                        "has_critical": False,
+                        "finding_count": 0,
+                        "findings": [],
+                        "raw_lines": [],
+                        "priority_lines": [],
+                        "other_lines": [],
+                        "aws_pairs": [],
+                        "hits": {"aws": False, "sendgrid": False, "stripe": False},
+                        "phase": "failed",
+                    }
+                    set_phase(apk.name, "failed", str(exc)[:120])
+                try:
+                    (output_dir / f"{apk.stem}.json").write_text(
+                        json.dumps(job, indent=2),
+                        encoding="utf-8",
+                    )
+                except OSError as exc:
+                    LOG.warning("Failed to write per-APK JSON for %s: %s", apk.name, exc)
+                try:
+                    mark_done(job)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.exception("mark_done failed for %s: %s", apk.name, exc)
+                    with _STATUS_LOCK:
+                        status["active"].pop(apk.name, None)
+                        if apk.name in status["current"]:
+                            status["current"].remove(apk.name)
+                        status["progress"]["completed"] += 1
+                        status["progress"]["failed"] += 1
+                        _write_status(status_file, status)
                 if progress is not None:
                     progress.update(1)
                     progress.set_postfix(
@@ -864,6 +952,11 @@ def run_batch(
                     )
     finally:
         stop_heartbeat.set()
+        with _STATUS_LOCK:
+            # Clear any leftover active entries so the UI never sticks on finished apps.
+            status["active"] = {}
+            status["current"] = []
+            _write_status(status_file, status)
 
     if progress is not None:
         progress.close()
