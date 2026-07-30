@@ -8,6 +8,7 @@ import {
   Modal,
   Progress,
   Row,
+  Select,
   Space,
   Table,
   Tag,
@@ -49,10 +50,12 @@ type Job = {
   other_lines?: string[];
   aws_pairs?: string[];
 };
+type DownloadSource = 'fdroid' | 'aptoide' | 'apkpure' | 'apkmirror';
 type Config = {
   threads?: number;
   download_count?: number;
   download_workers?: number;
+  download_source?: DownloadSource | string;
   loop_enabled?: boolean;
   loop_apps?: number;
   loop_threads?: number;
@@ -67,8 +70,22 @@ type LoopStatus = {
   apps?: number;
   threads?: number;
   download_workers?: number;
+  source?: string;
   message?: string;
 };
+
+const DOWNLOAD_SOURCE_OPTIONS: { value: DownloadSource; label: string }[] = [
+  { value: 'fdroid', label: 'F-Droid (open source)' },
+  { value: 'aptoide', label: 'Aptoide' },
+  { value: 'apkpure', label: 'APKPure' },
+  { value: 'apkmirror', label: 'APKMirror (experimental)' },
+];
+
+function normalizeDownloadSource(value?: string | null): DownloadSource {
+  const v = String(value || 'fdroid').trim().toLowerCase();
+  if (v === 'aptoide' || v === 'apkpure' || v === 'apkmirror' || v === 'fdroid') return v;
+  return 'fdroid';
+}
 type SystemStats = {
   cpu_percent?: number;
   memory?: {
@@ -222,6 +239,7 @@ const DashboardPage: React.FC = () => {
   const [source, setSource] = useState<'loading' | 'demo' | 'live'>('loading');
   const [downloadCount, setDownloadCount] = useState<number>(100);
   const [downloadWorkers, setDownloadWorkers] = useState<number>(10);
+  const [downloadSource, setDownloadSource] = useState<DownloadSource>('fdroid');
   const [threads, setThreads] = useState<number>(4);
   const [loopApps, setLoopApps] = useState<number>(100);
   const [loopThreads, setLoopThreads] = useState<number>(12);
@@ -239,6 +257,7 @@ const DashboardPage: React.FC = () => {
     if (!cfg && threadsFallback == null) return;
     if (cfg?.download_count) setDownloadCount(cfg.download_count);
     if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
+    if (cfg?.download_source) setDownloadSource(normalizeDownloadSource(cfg.download_source));
     if (cfg?.threads) setThreads(cfg.threads);
     else if (threadsFallback) setThreads(threadsFallback);
     if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
@@ -319,7 +338,11 @@ const DashboardPage: React.FC = () => {
       const res = await apiFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ count: downloadCount, workers: downloadWorkers }),
+        body: JSON.stringify({
+          count: downloadCount,
+          workers: downloadWorkers,
+          source: downloadSource,
+        }),
       });
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
@@ -393,6 +416,7 @@ const DashboardPage: React.FC = () => {
           apps: loopApps,
           threads: loopThreads,
           download_workers: loopDownloadWorkers,
+          source: downloadSource,
         }),
       });
       const data = res ? await res.json() : null;
@@ -543,8 +567,9 @@ const DashboardPage: React.FC = () => {
           {loopRunning ? <Tag color="purple">LOOP CYCLE {loop?.cycle ?? ''}</Tag> : null}
         </Space>
         <Paragraph type="secondary" style={{ maxWidth: 760 }}>
-          Download unique F-Droid APKs in parallel, control scan threads, run an automatic download→scan
-          loop, and export raw secrets (AWS as <Text code>AwsKey:AwsSecretKey</Text>).
+          Download unique APKs from F-Droid / Aptoide / APKPure / APKMirror, control scan threads, run an
+          automatic download→scan loop, and export raw secrets (AWS as{' '}
+          <Text code>AwsKey:AwsSecretKey</Text>).
         </Paragraph>
       </motion.div>
 
@@ -572,6 +597,16 @@ const DashboardPage: React.FC = () => {
           <Card className="glass-card" title={<Space><CloudDownloadOutlined /> Download APKs</Space>}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
               <div>
+                <Text type="secondary">APK source</Text>
+                <Select
+                  value={downloadSource}
+                  onChange={(v) => setDownloadSource(normalizeDownloadSource(v))}
+                  options={DOWNLOAD_SOURCE_OPTIONS}
+                  style={{ width: '100%', marginTop: 8 }}
+                  disabled={Boolean(sys?.download_running || loopRunning)}
+                />
+              </div>
+              <div>
                 <Text type="secondary">Number of new APKs (skips packages already downloaded or scanned)</Text>
                 <InputNumber
                   min={1}
@@ -594,6 +629,11 @@ const DashboardPage: React.FC = () => {
               <Button type="primary" block loading={busyDownload} icon={<CloudDownloadOutlined />} onClick={onDownload}>
                 Start download
               </Button>
+              {downloadSource === 'apkmirror' ? (
+                <Text type="secondary">
+                  APKMirror is Cloudflare-protected and often fails from servers — prefer Aptoide or APKPure.
+                </Text>
+              ) : null}
               <Button
                 danger
                 block
@@ -667,11 +707,20 @@ const DashboardPage: React.FC = () => {
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              Automatically downloads a batch, scans it, then repeats. Set apps per cycle, scan threads, and
-              parallel download workers.
+              Automatically downloads a batch from the selected APK source, scans it, then repeats.
             </Paragraph>
             <Row gutter={[16, 16]}>
-              <Col xs={24} md={8}>
+              <Col xs={24} md={6}>
+                <Text type="secondary">APK source</Text>
+                <Select
+                  value={downloadSource}
+                  onChange={(v) => setDownloadSource(normalizeDownloadSource(v))}
+                  options={DOWNLOAD_SOURCE_OPTIONS}
+                  style={{ width: '100%', marginTop: 8 }}
+                  disabled={loopRunning}
+                />
+              </Col>
+              <Col xs={24} md={6}>
                 <Text type="secondary">Apps per cycle</Text>
                 <InputNumber
                   min={1}
@@ -682,7 +731,7 @@ const DashboardPage: React.FC = () => {
                   disabled={loopRunning}
                 />
               </Col>
-              <Col xs={24} md={8}>
+              <Col xs={24} md={6}>
                 <Text type="secondary">Scan threads</Text>
                 <InputNumber
                   min={1}
@@ -693,7 +742,7 @@ const DashboardPage: React.FC = () => {
                   disabled={loopRunning}
                 />
               </Col>
-              <Col xs={24} md={8}>
+              <Col xs={24} md={6}>
                 <Text type="secondary">Download threads</Text>
                 <InputNumber
                   min={1}

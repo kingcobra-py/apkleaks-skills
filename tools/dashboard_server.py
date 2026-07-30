@@ -104,11 +104,22 @@ DEMO_STATUS = {
 }
 
 
+DOWNLOAD_SOURCES = ("fdroid", "aptoide", "apkpure", "apkmirror")
+
+
+def _normalize_download_source(value: object) -> str:
+    source = str(value or "fdroid").strip().lower()
+    if source not in DOWNLOAD_SOURCES:
+        return "fdroid"
+    return source
+
+
 def _default_config() -> dict:
     return {
         "threads": 4,
         "download_count": 100,
         "download_workers": 10,
+        "download_source": "fdroid",
         "loop_enabled": False,
         "loop_apps": 100,
         "loop_threads": 12,
@@ -137,6 +148,7 @@ def load_config() -> dict:
         1, min(32, int(cfg.get("loop_download_workers") or cfg["download_workers"]))
     )
     cfg["loop_enabled"] = bool(cfg.get("loop_enabled"))
+    cfg["download_source"] = _normalize_download_source(cfg.get("download_source"))
     return cfg
 
 
@@ -153,6 +165,7 @@ def save_config(cfg: dict) -> dict:
         1, min(32, int(merged.get("loop_download_workers") or merged["download_workers"]))
     )
     merged["loop_enabled"] = bool(merged.get("loop_enabled"))
+    merged["download_source"] = _normalize_download_source(merged.get("download_source"))
     CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
     return merged
 
@@ -327,10 +340,11 @@ def stop_download() -> dict:
                 proc.kill()
             except OSError:
                 pass
-    try:
-        subprocess.run(["pkill", "-f", "tools/fdroid_download.py"], check=False, timeout=5)
-    except Exception:  # noqa: BLE001
-        pass
+    for pattern in ("tools/apk_download.py", "tools/fdroid_download.py"):
+        try:
+            subprocess.run(["pkill", "-f", pattern], check=False, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
     _write_download_status({
         "ok": True,
         "state": "stopped",
@@ -392,29 +406,43 @@ def _wait_until(predicate, timeout: float | None = None, poll: float = 2.0) -> b
     return predicate()
 
 
-def start_download(count: int, workers: int | None = None) -> dict:
+def start_download(
+    count: int,
+    workers: int | None = None,
+    source: str | None = None,
+) -> dict:
     global _DOWNLOAD_PROC
     workers_n = max(1, min(32, int(workers if workers is not None else load_config().get("download_workers") or 10)))
-    cfg = save_config({"download_count": count, "download_workers": workers_n})
+    source_n = _normalize_download_source(
+        source if source is not None else load_config().get("download_source")
+    )
+    cfg = save_config({
+        "download_count": count,
+        "download_workers": workers_n,
+        "download_source": source_n,
+    })
     with _STATE_LOCK:
         if _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None:
             return {"ok": False, "error": "Download already running", "error_code": "BUSY"}
         APKS_DIR.mkdir(parents=True, exist_ok=True)
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = ROOT / "logs" / "fdroid_download.log"
+        log_path = ROOT / "logs" / "apk_download.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         _write_download_status({
             "ok": True,
             "state": "starting",
             "requested": count,
             "workers": workers_n,
+            "source": source_n,
             "started_at": _utc_now(),
         })
         venv_python = ROOT / ".venv" / "bin" / "python3"
         python = str(venv_python) if venv_python.is_file() else sys.executable
         cmd = [
             python,
-            str(TOOLS / "fdroid_download.py"),
+            str(TOOLS / "apk_download.py"),
+            "--source",
+            source_n,
             "-n",
             str(count),
             "-j",
@@ -441,6 +469,7 @@ def start_download(count: int, workers: int | None = None) -> dict:
             "state": "completed" if code == 0 else "failed",
             "requested": count,
             "workers": workers_n,
+            "source": source_n,
             "exit_code": code,
             "finished_at": _utc_now(),
             "apk_count": len(list(APKS_DIR.glob("*.apk"))) if APKS_DIR.is_dir() else 0,
@@ -452,10 +481,11 @@ def start_download(count: int, workers: int | None = None) -> dict:
         "state": "started",
         "requested": count,
         "workers": workers_n,
+        "source": source_n,
         "pid": proc.pid,
         "config": cfg,
         "message": (
-            f"Downloading {count} new APKs with {workers_n} parallel workers "
+            f"Downloading {count} new APKs from {source_n} with {workers_n} parallel workers "
             "(skipping packages already on disk or scanned)"
         ),
     }
@@ -470,6 +500,7 @@ def _loop_worker() -> None:
         apps = int(cfg.get("loop_apps") or 100)
         threads_n = int(cfg.get("loop_threads") or cfg.get("threads") or 12)
         workers_n = int(cfg.get("loop_download_workers") or cfg.get("download_workers") or 10)
+        source_n = _normalize_download_source(cfg.get("download_source"))
         cycle += 1
         _write_loop_status({
             "ok": True,
@@ -481,7 +512,11 @@ def _loop_worker() -> None:
             "apps": apps,
             "threads": threads_n,
             "download_workers": workers_n,
-            "message": f"Cycle {cycle}: downloading {apps} APKs ({workers_n} workers)",
+            "source": source_n,
+            "message": (
+                f"Cycle {cycle}: downloading {apps} APKs from {source_n} "
+                f"({workers_n} workers)"
+            ),
             "updated_at": _utc_now(),
         })
 
@@ -489,7 +524,7 @@ def _loop_worker() -> None:
         _wait_until(lambda: not _download_process_alive(), poll=2.0)
         if _LOOP_STOP.is_set():
             break
-        dl = start_download(apps, workers=workers_n)
+        dl = start_download(apps, workers=workers_n, source=source_n)
         if not dl.get("ok") and dl.get("error_code") != "BUSY":
             _write_loop_status({
                 "ok": False,
@@ -501,6 +536,7 @@ def _loop_worker() -> None:
                 "apps": apps,
                 "threads": threads_n,
                 "download_workers": workers_n,
+                "source": source_n,
                 "message": f"Cycle {cycle}: download failed — {dl.get('error')}",
                 "updated_at": _utc_now(),
             })
@@ -512,12 +548,15 @@ def _loop_worker() -> None:
 
         selected = 0
         downloaded = 0
-        manifest = APKS_DIR / "fdroid-manifest.json"
-        if manifest.is_file():
+        for manifest_name in ("download-manifest.json", "fdroid-manifest.json"):
+            manifest = APKS_DIR / manifest_name
+            if not manifest.is_file():
+                continue
             try:
                 man = json.loads(manifest.read_text(encoding="utf-8"))
                 selected = int(man.get("selected") or 0)
                 downloaded = int(man.get("downloaded") or 0)
+                break
             except (OSError, json.JSONDecodeError, TypeError, ValueError):
                 pass
 
@@ -531,9 +570,10 @@ def _loop_worker() -> None:
             "apps": apps,
             "threads": threads_n,
             "download_workers": workers_n,
+            "source": source_n,
             "message": (
                 f"Cycle {cycle}: scanning with {threads_n} threads "
-                f"(downloaded {downloaded}/{selected})"
+                f"(downloaded {downloaded}/{selected} from {source_n})"
             ),
             "updated_at": _utc_now(),
         })
@@ -549,6 +589,7 @@ def _loop_worker() -> None:
                 "apps": apps,
                 "threads": threads_n,
                 "download_workers": workers_n,
+                "source": source_n,
                 "message": f"Cycle {cycle}: scan failed — {scan.get('error')}",
                 "updated_at": _utc_now(),
             })
@@ -572,6 +613,7 @@ def _loop_worker() -> None:
             "apps": apps,
             "threads": threads_n,
             "download_workers": workers_n,
+            "source": source_n,
             "message": (
                 f"Cycle {cycle} complete"
                 + (" — no new apps, waiting before retry" if selected == 0 else " — starting next")
@@ -598,6 +640,7 @@ def start_loop(
     apps: int | None = None,
     threads: int | None = None,
     download_workers: int | None = None,
+    source: str | None = None,
 ) -> dict:
     global _LOOP_THREAD
     patch: dict = {"loop_enabled": True}
@@ -610,6 +653,8 @@ def start_loop(
     if download_workers is not None:
         patch["loop_download_workers"] = download_workers
         patch["download_workers"] = download_workers
+    if source is not None:
+        patch["download_source"] = _normalize_download_source(source)
     cfg = save_config(patch)
 
     # Read cycle outside the lock — never call load_loop_status while holding
@@ -645,6 +690,7 @@ def start_loop(
         "apps": cfg["loop_apps"],
         "threads": cfg["loop_threads"],
         "download_workers": cfg["loop_download_workers"],
+        "source": cfg.get("download_source") or "fdroid",
         "message": "Starting auto loop",
         "updated_at": _utc_now(),
     })
@@ -655,7 +701,8 @@ def start_loop(
         "config": cfg,
         "loop": load_loop_status(),
         "message": (
-            f"Auto loop started: {cfg['loop_apps']} apps/cycle, "
+            f"Auto loop started: {cfg['loop_apps']} apps/cycle from "
+            f"{cfg.get('download_source') or 'fdroid'}, "
             f"{cfg['loop_threads']} scan threads, "
             f"{cfg['loop_download_workers']} download workers"
         ),
@@ -1150,6 +1197,7 @@ class StatusHandler(BaseHTTPRequestHandler):
             cfg = load_config()
             count = body.get("count", cfg.get("download_count", 100))
             workers = body.get("workers", body.get("download_workers", cfg.get("download_workers", 10)))
+            source = body.get("source", body.get("download_source", cfg.get("download_source", "fdroid")))
             try:
                 count = int(count)
                 workers = int(workers)
@@ -1162,7 +1210,14 @@ class StatusHandler(BaseHTTPRequestHandler):
             if workers < 1 or workers > 32:
                 self._json({"ok": False, "error": "workers must be 1..32"}, 400)
                 return
-            self._json(start_download(count, workers=workers))
+            source_n = _normalize_download_source(source)
+            if str(source or "").strip() and source_n != str(source).strip().lower():
+                self._json({
+                    "ok": False,
+                    "error": f"source must be one of: {', '.join(DOWNLOAD_SOURCES)}",
+                }, 400)
+                return
+            self._json(start_download(count, workers=workers, source=source_n))
             return
 
         if path in ("/api/apks/clear", "/api/download/clear"):
@@ -1196,6 +1251,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                 "download_workers",
                 body.get("loop_download_workers", cfg.get("loop_download_workers", 10)),
             )
+            source = body.get("source", body.get("download_source", cfg.get("download_source", "fdroid")))
             try:
                 apps = int(apps)
                 threads = int(threads)
@@ -1212,7 +1268,19 @@ class StatusHandler(BaseHTTPRequestHandler):
             if workers < 1 or workers > 32:
                 self._json({"ok": False, "error": "download_workers must be 1..32"}, 400)
                 return
-            self._json(start_loop(apps=apps, threads=threads, download_workers=workers))
+            source_n = _normalize_download_source(source)
+            if str(source or "").strip() and source_n != str(source).strip().lower():
+                self._json({
+                    "ok": False,
+                    "error": f"source must be one of: {', '.join(DOWNLOAD_SOURCES)}",
+                }, 400)
+                return
+            self._json(start_loop(
+                apps=apps,
+                threads=threads,
+                download_workers=workers,
+                source=source_n,
+            ))
             return
 
         if path in ("/api/loop/stop",):

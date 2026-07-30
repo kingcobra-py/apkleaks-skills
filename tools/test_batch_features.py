@@ -27,6 +27,7 @@ from fdroid_download import (  # noqa: E402
     scanned_package_names,
     select_packages,
 )
+import apk_download  # noqa: E402
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
 
@@ -197,6 +198,36 @@ class FdroidDedupTests(unittest.TestCase):
             self.assertEqual(summary["downloaded"], 4)
             self.assertEqual(summary["workers"], 3)
             self.assertEqual(len(seen), 4)
+
+
+class ApkDownloadSourceTests(unittest.TestCase):
+    def test_apk_filename(self):
+        self.assertEqual(apk_download._apk_filename("com.foo", 12), "com.foo_12.apk")
+        self.assertEqual(apk_download._apk_filename("com.foo", None), "com.foo_0.apk")
+
+    def test_unknown_source_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                apk_download.run("not-a-store", count=1, out_dir=Path(tmp))
+
+    def test_aptoide_resolve_uses_path(self):
+        meta = {
+            "packageName": "com.demo.app",
+            "name": "Demo",
+            "versionCode": 3,
+            "path": "https://example.com/demo.apk",
+        }
+        resolved = apk_download._resolve_aptoide_download(meta)
+        self.assertEqual(resolved["url"], "https://example.com/demo.apk")
+        self.assertEqual(resolved["apkName"], "com.demo.app_3.apk")
+
+    def test_apkpure_url(self):
+        resolved = apk_download._resolve_apkpure_download({
+            "packageName": "com.demo.app",
+            "versionCode": 9,
+        })
+        self.assertIn("com.demo.app", resolved["url"])
+        self.assertEqual(resolved["apkName"], "com.demo.app_9.apk")
 
 
 class ResultsFormatTests(unittest.TestCase):
