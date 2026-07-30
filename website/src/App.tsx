@@ -22,7 +22,7 @@ const App: React.FC = () => {
       <Layout.Content>
         <Outlet />
       </Layout.Content>
-      <Footer style={{ background: '#0f172a', textAlign: 'center', padding: '40px 24px' }}>
+      <Footer style={{ background: '#020617', textAlign: 'center', padding: '40px 24px', borderTop: '1px solid #1e293b' }}>
         <Text style={{ color: '#94a3b8' }}>
           {t('footer.copyright').replace('year', String(new Date().getFullYear()))} — {t('footer.built')}&nbsp;
           <a href="https://github.com/dwisiswant0/apkleaks" target="_blank" rel="noreferrer">
@@ -31,10 +31,10 @@ const App: React.FC = () => {
         </Text>
         <br />
         <Space style={{ marginTop: 12 }}>
-          <a href="https://github.com/android-security-engineer/apkleaks-skills" target="_blank" rel="noreferrer" style={{ color: '#818cf8' }}>
+          <a href="https://github.com/android-security-engineer/apkleaks-skills" target="_blank" rel="noreferrer" style={{ color: '#67e8f9' }}>
             <GithubOutlined /> GitHub
           </a>
-          <Button type="text" size="small" icon={<GlobalOutlined />} onClick={toggleLang} style={{ color: '#818cf8' }}>
+          <Button type="text" size="small" icon={<GlobalOutlined />} onClick={toggleLang} style={{ color: '#67e8f9' }}>
             {i18n.language === 'zh' ? 'EN' : '中文'}
           </Button>
         </Space>

@@ -141,6 +141,21 @@ class ResultsFormatTests(unittest.TestCase):
             norm["other_lines"],
         )
 
+    def test_unpaired_aws_key_stays_in_priority(self):
+        job = {
+            "apk": "key-only.apk",
+            "findings": [
+                {
+                    "name": "Amazon_AWS_Access_Key_ID",
+                    "severity": "critical",
+                    "matches": ["AKIAIOSFODNN7EXAMPLE"],
+                },
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertIn("AKIAIOSFODNN7EXAMPLE", norm["priority_lines"])
+        self.assertEqual(norm["other_lines"], [])
+
     def test_priority_sendgrid_and_sk_live(self):
         sg = "SG." + ("A" * 22) + "." + ("B" * 43)
         # Build at runtime so repo secret scanners do not flag the fixture literal.

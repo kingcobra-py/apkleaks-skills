@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Badge,
   Button,
@@ -86,6 +86,8 @@ type Status = {
   jobs: Job[];
   logs: LogLine[];
   raw_lines?: string[];
+  priority_lines?: string[];
+  other_lines?: string[];
   aws_pairs?: string[];
   system?: SystemStats;
   config?: { threads?: number; download_count?: number };
@@ -154,10 +156,11 @@ const monoBoxStyle: React.CSSProperties = {
   lineHeight: 1.7,
   maxHeight: 280,
   overflow: 'auto',
-  background: '#0f172a',
+  background: '#020617',
   color: '#e2e8f0',
   padding: 16,
   borderRadius: 8,
+  border: '1px solid #1e293b',
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-all',
 };
@@ -177,35 +180,57 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response | nu
 }
 
 const DashboardPage: React.FC = () => {
-  const [status, setStatus] = useState<Status>(DEMO);
-  const [source, setSource] = useState<'demo' | 'live'>('demo');
+  const [status, setStatus] = useState<Status | null>(null);
+  const [source, setSource] = useState<'loading' | 'demo' | 'live'>('loading');
   const [downloadCount, setDownloadCount] = useState<number>(100);
   const [threads, setThreads] = useState<number>(4);
   const [busyDownload, setBusyDownload] = useState(false);
   const [busyThreads, setBusyThreads] = useState(false);
-  const [priorityLines, setPriorityLines] = useState<string[]>([
-    'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
-  ]);
-  const [otherLines, setOtherLines] = useState<string[]>(['example_other_api_token_value_123456']);
+  const [priorityLines, setPriorityLines] = useState<string[]>([]);
+  const [otherLines, setOtherLines] = useState<string[]>([]);
+  const sawLiveRef = useRef(false);
+
+  const applyDemo = useCallback(() => {
+    setStatus(DEMO);
+    setSource('demo');
+    setPriorityLines([
+      'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    ]);
+    setOtherLines(['example_other_api_token_value_123456']);
+    setDownloadCount(DEMO.system?.config?.download_count ?? 100);
+    setThreads(DEMO.threads ?? 4);
+  }, []);
 
   const refresh = useCallback(async () => {
     const res = await apiFetch('/api/status');
-    if (!res || !res.ok) return;
+    if (!res || !res.ok) {
+      // Never flash demo secrets over a live session if the API blips.
+      if (!sawLiveRef.current) applyDemo();
+      return;
+    }
     const data = (await res.json()) as Status;
     if (!data?.progress) return;
+    const isDemo = Boolean(data.demo);
+    if (!isDemo) sawLiveRef.current = true;
     setStatus(data);
-    setSource(data.demo ? 'demo' : 'live');
+    setSource(isDemo ? 'demo' : 'live');
     if (data.config?.download_count) setDownloadCount(data.config.download_count);
     if (data.config?.threads) setThreads(data.config.threads);
     else if (data.threads) setThreads(data.threads);
 
+    // Prefer dedicated results endpoint; fall back to status payload so Priority
+    // / Other never briefly clear when /api/results is slow.
+    let nextPriority = Array.isArray(data.priority_lines) ? data.priority_lines : null;
+    let nextOther = Array.isArray(data.other_lines) ? data.other_lines : null;
     const resultsRes = await apiFetch('/api/results');
     if (resultsRes?.ok) {
       const agg = await resultsRes.json();
-      if (Array.isArray(agg?.priority_lines)) setPriorityLines(agg.priority_lines);
-      if (Array.isArray(agg?.other_lines)) setOtherLines(agg.other_lines);
+      if (Array.isArray(agg?.priority_lines)) nextPriority = agg.priority_lines;
+      if (Array.isArray(agg?.other_lines)) nextOther = agg.other_lines;
     }
-  }, []);
+    if (nextPriority !== null) setPriorityLines(nextPriority);
+    if (nextOther !== null) setOtherLines(nextOther);
+  }, [applyDemo]);
 
   useEffect(() => {
     let cancelled = false;
@@ -220,6 +245,8 @@ const DashboardPage: React.FC = () => {
       window.clearInterval(id);
     };
   }, [refresh]);
+
+  const view = status ?? DEMO;
 
   const onDownload = async () => {
     setBusyDownload(true);
@@ -288,23 +315,23 @@ const DashboardPage: React.FC = () => {
     downloadText('other-apis-results.txt', text);
   };
 
-  const stateColor = status.state === 'completed' ? 'success' : status.state === 'running' ? 'processing' : 'default';
-  const sys = status.system;
+  const stateColor = view.state === 'completed' ? 'success' : view.state === 'running' ? 'processing' : 'default';
+  const sys = view.system;
   const cpu = sys?.cpu_percent ?? 0;
   const mem = sys?.memory?.percent ?? 0;
   const activeApps = useMemo(() => {
-    const map = status.active || {};
+    const map = view.active || {};
     const list = Object.values(map);
     if (list.length) return list.sort((a, b) => (b.elapsed_ms || 0) - (a.elapsed_ms || 0));
     // Fallback for older status.json without active map
-    return (status.current || []).map((apk) => ({
+    return (view.current || []).map((apk) => ({
       apk,
       phase: 'scanning',
       percent: 50,
       message: 'Working…',
       elapsed_ms: 0,
     }));
-  }, [status.active, status.current]);
+  }, [view.active, view.current]);
 
   const columns = useMemo(
     () => [
@@ -348,16 +375,18 @@ const DashboardPage: React.FC = () => {
   );
 
   return (
-    <div style={{ padding: '32px 24px', maxWidth: 1200, margin: '0 auto' }}>
+    <div className="dashboard-page" style={{ padding: '32px 24px', maxWidth: 1200, margin: '0 auto' }}>
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
         <Space align="center" style={{ marginBottom: 8 }} wrap>
-          <Title level={2} style={{ margin: 0 }}>
+          <Title level={2} style={{ margin: 0, color: '#e2e8f0' }}>
             Batch Scan Dashboard
           </Title>
-          <Badge status={stateColor as 'success' | 'processing' | 'default'} text={status.state.toUpperCase()} />
-          <Tag color={source === 'live' ? 'green' : 'gold'}>{source === 'live' ? 'LIVE' : 'DEMO'}</Tag>
+          <Badge status={stateColor as 'success' | 'processing' | 'default'} text={view.state.toUpperCase()} />
+          <Tag color={source === 'live' ? 'green' : source === 'loading' ? 'default' : 'gold'}>
+            {source === 'live' ? 'LIVE' : source === 'loading' ? 'LOADING' : 'DEMO'}
+          </Tag>
           {sys?.download_running ? <Tag color="blue">DOWNLOADING</Tag> : null}
-          {sys?.scan_running ? <Tag color="purple">SCANNING</Tag> : null}
+          {sys?.scan_running ? <Tag color="cyan">SCANNING</Tag> : null}
         </Space>
         <Paragraph type="secondary" style={{ maxWidth: 760 }}>
           Download unique F-Droid APKs, control scan threads, watch CPU/RAM, and export raw secrets (AWS as{' '}
@@ -372,6 +401,15 @@ const DashboardPage: React.FC = () => {
           showIcon
           message="Showing demo data"
           description="Start the dashboard API on the VPS to switch to LIVE status and controls."
+        />
+      )}
+      {source === 'loading' && (
+        <Alert
+          style={{ marginBottom: 20 }}
+          type="info"
+          showIcon
+          message="Connecting to scan API…"
+          description="Priority and Other results load from the live results store — demo secrets are not shown."
         />
       )}
 
@@ -412,7 +450,7 @@ const DashboardPage: React.FC = () => {
               <Button type="primary" block loading={busyThreads} icon={<ThunderboltOutlined />} onClick={onApplyThreads}>
                 Apply & restart scan
               </Button>
-              <Text type="secondary">Active setting: {status.threads ?? threads}</Text>
+              <Text type="secondary">Active setting: {view.threads ?? threads}</Text>
             </Space>
           </Card>
         </Col>
@@ -427,7 +465,7 @@ const DashboardPage: React.FC = () => {
                 <Text type="secondary">
                   <HddOutlined /> RAM {sys?.memory?.used_gb ?? '—'} / {sys?.memory?.total_gb ?? '—'} GB
                 </Text>
-                <Progress percent={Math.min(100, Number(mem) || 0)} strokeColor="#818cf8" />
+                <Progress percent={Math.min(100, Number(mem) || 0)} strokeColor="#38bdf8" />
               </div>
             </Space>
           </Card>
@@ -438,17 +476,17 @@ const DashboardPage: React.FC = () => {
         <Col xs={24}>
           <Card className="glass-card" title="Progress">
             <Progress
-              percent={status.progress.percent}
-              status={status.state === 'running' ? 'active' : status.progress.failed ? 'exception' : 'success'}
-              strokeColor={{ from: '#06b6d4', to: '#4f46e5' }}
+              percent={view.progress.percent}
+              status={view.state === 'running' ? 'active' : view.progress.failed ? 'exception' : 'success'}
+              strokeColor={{ from: '#06b6d4', to: '#38bdf8' }}
             />
             <Space wrap style={{ marginTop: 12 }}>
-              <Tag icon={<SyncOutlined spin={status.state === 'running'} />}>
-                {status.progress.completed}/{status.progress.total} done
+              <Tag icon={<SyncOutlined spin={view.state === 'running'} />}>
+                {view.progress.completed}/{view.progress.total} done
               </Tag>
-              <Tag color="success">{status.progress.succeeded} ok</Tag>
-              <Tag color="error">{status.progress.failed} failed</Tag>
-              <Tag>threads: {status.threads ?? '—'}</Tag>
+              <Tag color="success">{view.progress.succeeded} ok</Tag>
+              <Tag color="error">{view.progress.failed} failed</Tag>
+              <Tag>threads: {view.threads ?? '—'}</Tag>
               <Tag icon={<ApiOutlined />} color="orange">
                 priority: {priorityLines.length}
               </Tag>
@@ -464,7 +502,7 @@ const DashboardPage: React.FC = () => {
             className="glass-card"
             title={
               <Space>
-                <SyncOutlined spin={activeApps.length > 0 && status.state === 'running'} />
+                <SyncOutlined spin={activeApps.length > 0 && view.state === 'running'} />
                 Apps in progress
                 <Tag color="processing">{activeApps.length}</Tag>
               </Space>
@@ -509,7 +547,7 @@ const DashboardPage: React.FC = () => {
               </Row>
             ) : (
               <Text type="secondary">
-                {status.state === 'running' ? 'Waiting for the next APK worker…' : 'No apps scanning right now.'}
+                {view.state === 'running' ? 'Waiting for the next APK worker…' : 'No apps scanning right now.'}
               </Text>
             )}
           </Card>
@@ -573,7 +611,7 @@ const DashboardPage: React.FC = () => {
               size="small"
               rowKey={(r) => r.apk}
               pagination={{ pageSize: 8 }}
-              dataSource={[...status.jobs].reverse()}
+              dataSource={[...view.jobs].reverse()}
               columns={columns}
             />
           </Card>
@@ -581,7 +619,7 @@ const DashboardPage: React.FC = () => {
         <Col xs={24} lg={10}>
           <Card className="glass-card" title="Logs" styles={{ body: { maxHeight: 420, overflow: 'auto', background: '#0f172a' } }}>
             <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12, lineHeight: 1.7 }}>
-              {(status.logs || []).slice(-80).map((line, idx) => (
+              {(view.logs || []).slice(-80).map((line, idx) => (
                 <div
                   key={`${line.ts}-${idx}`}
                   style={{ color: line.level === 'error' ? '#fca5a5' : line.level === 'warning' ? '#fcd34d' : '#cbd5e1' }}

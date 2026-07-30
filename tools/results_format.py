@@ -231,12 +231,12 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
                 if pair not in aws_pairs:
                     aws_pairs.append(pair)
                     _add(priority, pair)
-    elif aws_keys:
+    else:
+        # Keep unpaired AWS material in Priority so it does not vanish into Other.
         for key in aws_keys:
-            _add(other, format_other_line("Amazon_AWS_Access_Key_ID", key))
-    elif aws_secrets:
+            _add(priority, key)
         for secret in aws_secrets:
-            _add(other, format_other_line("AWS_Secret_Access_Key", secret))
+            _add(priority, secret)
 
     priority = [x for x in priority if not is_noise_value(x) or ":" in x]
     # Drop other lines whose raw value is noise, or that duplicate a priority value

@@ -486,6 +486,28 @@ def run_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
     status_file = status_path or (output_dir / "status.json")
     status = _empty_status(len(apks), threads, str(input_dir), str(output_dir))
+    # Keep previously found secrets visible while a new scan starts.
+    try:
+        seed_jobs: list[dict[str, Any]] = []
+        for path in output_dir.glob("*.json"):
+            if path.name in {"status.json", "summary.json", "dashboard-config.json", "download-status.json"}:
+                continue
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(job, dict) and job.get("apk"):
+                seed_jobs.append(job)
+        if seed_jobs:
+            seeded = aggregate_results(seed_jobs)
+            status["priority_lines"] = seeded.get("priority_lines") or []
+            status["other_lines"] = seeded.get("other_lines") or []
+            status["raw_lines"] = seeded.get("lines") or []
+            status["aws_pairs"] = seeded.get("aws_pairs") or []
+            status["counts"]["findings"] = len(status["raw_lines"])
+            status["counts"]["has_aws"] = len(status["aws_pairs"])
+    except Exception:  # noqa: BLE001
+        pass
     # Pre-populate queue snapshot so UI can show pending apps
     status["queue_preview"] = [p.name for p in apks[:50]]
     _append_log(status, "info", f"Discovered {len(apks)} APK(s); threads={threads}")

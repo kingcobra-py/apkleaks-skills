@@ -312,13 +312,52 @@ def start_scan(threads: int | None = None) -> dict:
     }
 
 
+def _iter_result_jobs(status_jobs: list | None = None) -> list[dict]:
+    """Merge status jobs with on-disk per-APK JSON (prefer full findings)."""
+    jobs: list[dict] = list(status_jobs or [])
+    if RESULTS_DIR.is_dir():
+        for path in RESULTS_DIR.glob("*.json"):
+            if path.name in {
+                "status.json",
+                "summary.json",
+                "dashboard-config.json",
+                "download-status.json",
+            }:
+                continue
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(job, dict) and job.get("apk"):
+                jobs.append(job)
+    by_name: dict[str, dict] = {}
+    for job in jobs:
+        name = job.get("apk") or ""
+        if not name:
+            continue
+        prev = by_name.get(name)
+        if prev is None:
+            by_name[name] = job
+            continue
+        prev_has = bool(prev.get("findings") or prev.get("results"))
+        cur_has = bool(job.get("findings") or job.get("results"))
+        prev_pri = len(prev.get("priority_lines") or []) + len(prev.get("other_lines") or [])
+        cur_pri = len(job.get("priority_lines") or []) + len(job.get("other_lines") or [])
+        if cur_has and not prev_has:
+            by_name[name] = job
+        elif cur_has == prev_has and cur_pri > prev_pri:
+            by_name[name] = job
+    return list(by_name.values())
+
+
 def load_status(status_path: Path) -> dict:
     if status_path.is_file():
         try:
             data = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # Recompute cleaned raw lines from jobs (drop historical noise)
-                agg = aggregate_results(data.get("jobs") or [])
+                # Always merge disk per-APK files so Priority/Other do not vanish
+                # when a new scan rewrites status.json with an empty jobs list.
+                agg = aggregate_results(_iter_result_jobs(data.get("jobs") or []))
                 data["raw_lines"] = agg["lines"]
                 data["priority_lines"] = agg.get("priority_lines") or []
                 data["other_lines"] = agg.get("other_lines") or []
@@ -336,38 +375,8 @@ def load_status(status_path: Path) -> dict:
 
 def collect_results(status_path: Path) -> dict:
     status = load_status(status_path)
-    jobs = list(status.get("jobs") or [])
-    # Also merge per-APK result JSON files
-    if RESULTS_DIR.is_dir():
-        for path in RESULTS_DIR.glob("*.json"):
-            if path.name in {
-                "status.json",
-                "summary.json",
-                "dashboard-config.json",
-                "download-status.json",
-            }:
-                continue
-            try:
-                job = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(job, dict) and job.get("apk"):
-                jobs.append(job)
-    # Deduplicate by apk name (prefer jobs that still have findings/results)
-    by_name: dict[str, dict] = {}
-    for job in jobs:
-        name = job.get("apk") or ""
-        if not name:
-            continue
-        prev = by_name.get(name)
-        if prev is None:
-            by_name[name] = job
-            continue
-        prev_has = bool(prev.get("findings") or prev.get("results"))
-        cur_has = bool(job.get("findings") or job.get("results"))
-        if cur_has and not prev_has:
-            by_name[name] = job
-    agg = aggregate_results(list(by_name.values()))
+    jobs = _iter_result_jobs(status.get("jobs") or [])
+    agg = aggregate_results(jobs)
     agg["total"] = len(agg.get("lines") or [])
     agg["priority_total"] = len(agg.get("priority_lines") or [])
     agg["other_total"] = len(agg.get("other_lines") or [])

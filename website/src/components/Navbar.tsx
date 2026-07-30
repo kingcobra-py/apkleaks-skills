@@ -24,7 +24,7 @@ const Navbar: React.FC = () => {
   return (
     <Header
       style={{
-        background: '#0f172a',
+        background: '#020617',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
@@ -37,7 +37,7 @@ const Navbar: React.FC = () => {
     >
       <Link to="/dashboard" style={{ textDecoration: 'none' }}>
         <span style={{ color: '#fff', fontSize: '1.2rem', fontWeight: 700 }}>APKLeaks</span>
-        <span style={{ color: '#818cf8', fontWeight: 400, marginLeft: 6 }}>Dashboard</span>
+        <span style={{ color: '#22d3ee', fontWeight: 400, marginLeft: 6 }}>Dashboard</span>
       </Link>
       <Menu
         theme="dark"
@@ -52,7 +52,7 @@ const Navbar: React.FC = () => {
           size="small"
           icon={<GlobalOutlined />}
           onClick={toggleLang}
-          style={{ color: '#818cf8', fontSize: '0.9rem' }}
+          style={{ color: '#67e8f9', fontSize: '0.9rem' }}
         >
           {i18n.language === 'zh' ? 'EN' : '中文'}
         </Button>
