@@ -231,6 +231,19 @@ const DashboardPage: React.FC = () => {
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
   const sawLiveRef = useRef(false);
+  const formSeededRef = useRef(false);
+
+  const seedFormFromConfig = useCallback((cfg?: Config | null, threadsFallback?: number) => {
+    if (!cfg && threadsFallback == null) return;
+    if (cfg?.download_count) setDownloadCount(cfg.download_count);
+    if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
+    if (cfg?.threads) setThreads(cfg.threads);
+    else if (threadsFallback) setThreads(threadsFallback);
+    if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
+    if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
+    if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
+    else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
+  }, []);
 
   const applyDemo = useCallback(() => {
     setStatus(DEMO);
@@ -239,13 +252,10 @@ const DashboardPage: React.FC = () => {
       'AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
     ]);
     setOtherLines(['example_other_api_token_value_123456']);
-    setDownloadCount(DEMO.system?.config?.download_count ?? 100);
-    setDownloadWorkers(DEMO.system?.config?.download_workers ?? 10);
-    setThreads(DEMO.threads ?? 4);
-    setLoopApps(DEMO.system?.config?.loop_apps ?? 100);
-    setLoopThreads(DEMO.system?.config?.loop_threads ?? 12);
-    setLoopDownloadWorkers(DEMO.system?.config?.download_workers ?? 10);
-  }, []);
+    // Demo may re-seed form; allow a later live response to seed once.
+    formSeededRef.current = false;
+    seedFormFromConfig(DEMO.system?.config, DEMO.threads);
+  }, [seedFormFromConfig]);
 
   const refresh = useCallback(async (opts?: { results?: boolean }) => {
     const wantResults = opts?.results !== false;
@@ -261,17 +271,10 @@ const DashboardPage: React.FC = () => {
     if (!isDemo) sawLiveRef.current = true;
     setStatus(data);
     setSource(isDemo ? 'demo' : 'live');
-    const cfg = data.config || data.system?.config;
-    // Only sync form defaults when controls are idle (avoid fighting the user).
-    if (!busyDownload && !busyLoop && !busyThreads) {
-      if (cfg?.download_count) setDownloadCount(cfg.download_count);
-      if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
-      if (cfg?.threads) setThreads(cfg.threads);
-      else if (data.threads) setThreads(data.threads);
-      if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
-      if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
-      if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
-      else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
+    // Seed inputs once from server config — never overwrite while the user is typing.
+    if (!isDemo && !formSeededRef.current) {
+      seedFormFromConfig(data.config || data.system?.config, data.threads);
+      formSeededRef.current = true;
     }
 
     // Prefer lines already on status (fast). Only hit /api/results occasionally.
@@ -287,7 +290,7 @@ const DashboardPage: React.FC = () => {
     }
     if (nextPriority !== null) setPriorityLines(nextPriority);
     if (nextOther !== null) setOtherLines(nextOther);
-  }, [applyDemo, busyDownload, busyLoop, busyThreads]);
+  }, [applyDemo, seedFormFromConfig]);
 
   useEffect(() => {
     let cancelled = false;
