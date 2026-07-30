@@ -798,6 +798,9 @@ const DashboardPage: React.FC = () => {
                       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
                         <Text type="secondary" style={{ fontSize: 12 }}>
                           {app.message}
+                          {app.phase === 'scanning' && String(app.message || '').includes('Scanning files')
+                            ? ' (files inside this APK)'
+                            : ''}
                         </Text>
                         <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
                           {((app.elapsed_ms || 0) / 1000).toFixed(1)}s

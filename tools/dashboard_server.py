@@ -366,6 +366,16 @@ def stop_scan() -> dict:
         subprocess.run(["pkill", "-f", "tools/batch_scan.py"], check=False, timeout=5)
     except Exception:  # noqa: BLE001
         pass
+    # Jadx children can survive if the parent was an orphan from a prior dashboard.
+    try:
+        subprocess.run(
+            ["pkill", "-f", "jadx.cli.JadxCLI /opt/apkleaks-skills/apks/"],
+            check=False,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(0.3)
     _SYSTEM_CACHE["built_at"] = 0.0
     return {"ok": True, "message": "Scan stopped"}
 
@@ -725,28 +735,12 @@ def start_scan(threads: int | None = None) -> dict:
     global _SCAN_PROC
     cfg = save_config({"threads": threads} if threads is not None else {})
     threads_n = int(cfg["threads"])
-    old_proc: subprocess.Popen | None = None
-    with _STATE_LOCK:
-        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
-            old_proc = _SCAN_PROC
-            _SCAN_PROC = None
 
-    # Kill/wait outside the lock so /api/status never blocks on scan restart.
-    if old_proc is not None:
-        try:
-            os.killpg(os.getpgid(old_proc.pid), 15)
-        except OSError:
-            try:
-                old_proc.terminate()
-            except OSError:
-                pass
-        try:
-            old_proc.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            try:
-                old_proc.kill()
-            except OSError:
-                pass
+    # Always kill tracked + orphan batch_scan processes. Dashboard restarts lose
+    # _SCAN_PROC, and the auto-loop used to spawn a second scanner that fought
+    # over status.json (dual progress bars / stuck "starting" apps).
+    stop_scan()
+    time.sleep(0.4)
 
     APKS_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -754,6 +748,8 @@ def start_scan(threads: int | None = None) -> dict:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     venv_python = ROOT / ".venv" / "bin" / "python3"
     python = str(venv_python) if venv_python.is_file() else sys.executable
+    # With many APK workers, jadx -j 2 multiplies JVM load; keep jadx single-threaded.
+    jadx_jobs = 1 if threads_n >= 8 else 2
     cmd = [
         python,
         str(TOOLS / "batch_scan.py"),
@@ -766,7 +762,7 @@ def start_scan(threads: int | None = None) -> dict:
         "-s",
         str(cfg.get("severity") or "high"),
         "-a",
-        "-j 2",
+        f"-j {jadx_jobs}",
         "--status",
         str(RESULTS_DIR / "status.json"),
     ]
@@ -787,7 +783,7 @@ def start_scan(threads: int | None = None) -> dict:
         "threads": threads_n,
         "pid": proc.pid,
         "config": cfg,
-        "message": f"Batch scan started with {threads_n} threads",
+        "message": f"Batch scan started with {threads_n} threads (jadx -j {jadx_jobs})",
     }
 
 

@@ -195,10 +195,25 @@ def _write_status(path: Path, status: dict[str, Any]) -> None:
         if isinstance(started, (int, float)):
             info["elapsed_ms"] = int((now - started) * 1000)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    # Don't persist internal timestamps helper fields? Keep them — useful and small.
-    tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # Unique temp name — two batch_scan processes used to race on status.tmp
+    # and crash the heartbeat with FileNotFoundError.
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        LOG.warning("Failed to write status %s: %s", path, exc)
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            # Python <3.8 compat / older pathlib
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        except OSError:
+            pass
 
 
 def _append_log(status: dict[str, Any], level: str, message: str, limit: int = 200) -> None:
