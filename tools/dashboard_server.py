@@ -25,12 +25,22 @@ APKS_DIR = ROOT / "apks"
 RESULTS_DIR = ROOT / "results"
 CONFIG_PATH = RESULTS_DIR / "dashboard-config.json"
 DOWNLOAD_STATUS_PATH = RESULTS_DIR / "download-status.json"
+LOOP_STATUS_PATH = RESULTS_DIR / "loop-status.json"
 
 _STATE_LOCK = threading.Lock()
 _DOWNLOAD_PROC: subprocess.Popen | None = None
 _SCAN_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
 _RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
+_LOOP_STOP = threading.Event()
+_LOOP_THREAD: threading.Thread | None = None
+_META_SKIP = {
+    "status.json",
+    "summary.json",
+    "dashboard-config.json",
+    "download-status.json",
+    "loop-status.json",
+}
 
 
 DEMO_STATUS = {
@@ -97,6 +107,11 @@ def _default_config() -> dict:
     return {
         "threads": 4,
         "download_count": 100,
+        "download_workers": 10,
+        "loop_enabled": False,
+        "loop_apps": 100,
+        "loop_threads": 12,
+        "loop_download_workers": 10,
         "severity": "high",
         "apks_dir": str(APKS_DIR),
         "results_dir": str(RESULTS_DIR),
@@ -114,6 +129,13 @@ def load_config() -> dict:
             pass
     cfg["threads"] = max(1, min(32, int(cfg.get("threads") or 4)))
     cfg["download_count"] = max(1, min(5000, int(cfg.get("download_count") or 100)))
+    cfg["download_workers"] = max(1, min(32, int(cfg.get("download_workers") or 10)))
+    cfg["loop_apps"] = max(1, min(5000, int(cfg.get("loop_apps") or 100)))
+    cfg["loop_threads"] = max(1, min(32, int(cfg.get("loop_threads") or cfg["threads"])))
+    cfg["loop_download_workers"] = max(
+        1, min(32, int(cfg.get("loop_download_workers") or cfg["download_workers"]))
+    )
+    cfg["loop_enabled"] = bool(cfg.get("loop_enabled"))
     return cfg
 
 
@@ -123,6 +145,13 @@ def save_config(cfg: dict) -> dict:
     merged.update(cfg)
     merged["threads"] = max(1, min(32, int(merged.get("threads") or 4)))
     merged["download_count"] = max(1, min(5000, int(merged.get("download_count") or 100)))
+    merged["download_workers"] = max(1, min(32, int(merged.get("download_workers") or 10)))
+    merged["loop_apps"] = max(1, min(5000, int(merged.get("loop_apps") or 100)))
+    merged["loop_threads"] = max(1, min(32, int(merged.get("loop_threads") or merged["threads"])))
+    merged["loop_download_workers"] = max(
+        1, min(32, int(merged.get("loop_download_workers") or merged["download_workers"]))
+    )
+    merged["loop_enabled"] = bool(merged.get("loop_enabled"))
     CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
     return merged
 
@@ -170,6 +199,7 @@ def system_stats() -> dict:
     with _STATE_LOCK:
         download_running = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
         scan_running = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
+        loop_running = _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set()
     if not scan_running:
         try:
             out = subprocess.check_output(
@@ -195,6 +225,8 @@ def system_stats() -> dict:
         "apk_count": apk_count,
         "download_running": download_running,
         "scan_running": scan_running,
+        "loop_running": loop_running,
+        "loop": load_loop_status(),
         "config": load_config(),
     }
 
@@ -204,9 +236,129 @@ def _write_download_status(payload: dict) -> None:
     DOWNLOAD_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def start_download(count: int) -> dict:
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _write_loop_status(payload: dict) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    LOOP_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_loop_status() -> dict:
+    default = {
+        "ok": True,
+        "enabled": False,
+        "state": "idle",
+        "cycle": 0,
+        "phase": "idle",
+        "message": "Loop idle",
+        "apps": 100,
+        "threads": 12,
+        "download_workers": 10,
+    }
+    if LOOP_STATUS_PATH.is_file():
+        try:
+            data = json.loads(LOOP_STATUS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                default.update(data)
+        except json.JSONDecodeError:
+            pass
+    with _STATE_LOCK:
+        alive = _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set()
+    default["enabled"] = bool(alive or load_config().get("loop_enabled"))
+    if alive:
+        default["running"] = True
+    else:
+        default["running"] = False
+        if default.get("state") in ("running", "starting"):
+            default["state"] = "idle"
+            default["phase"] = "idle"
+    return default
+
+
+def _scan_process_alive() -> bool:
+    with _STATE_LOCK:
+        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
+            return True
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "tools/batch_scan.py"], text=True).strip()
+        return bool(out)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _download_process_alive() -> bool:
+    with _STATE_LOCK:
+        return _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
+
+
+def stop_download() -> dict:
     global _DOWNLOAD_PROC
-    cfg = save_config({"download_count": count})
+    with _STATE_LOCK:
+        proc = _DOWNLOAD_PROC
+    if proc is None or proc.poll() is not None:
+        return {"ok": True, "message": "No download running"}
+    try:
+        os.killpg(os.getpgid(proc.pid), 15)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=8)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    return {"ok": True, "message": "Download stopped"}
+
+
+def stop_scan() -> dict:
+    global _SCAN_PROC
+    with _STATE_LOCK:
+        proc = _SCAN_PROC
+    # Prefer tracked proc, but also kill orphan batch_scan children.
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), 15)
+        except OSError:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=8)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        subprocess.run(["pkill", "-f", "tools/batch_scan.py"], check=False, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "message": "Scan stopped"}
+
+
+def _wait_until(predicate, timeout: float | None = None, poll: float = 2.0) -> bool:
+    """Wait until predicate() is True or stop/timeout. Returns True if predicate met."""
+    deadline = None if timeout is None else (time.time() + timeout)
+    while not _LOOP_STOP.is_set():
+        if predicate():
+            return True
+        if deadline is not None and time.time() >= deadline:
+            return predicate()
+        _LOOP_STOP.wait(poll)
+    return predicate()
+
+
+def start_download(count: int, workers: int | None = None) -> dict:
+    global _DOWNLOAD_PROC
+    workers_n = max(1, min(32, int(workers if workers is not None else load_config().get("download_workers") or 10)))
+    cfg = save_config({"download_count": count, "download_workers": workers_n})
     with _STATE_LOCK:
         if _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None:
             return {"ok": False, "error": "Download already running", "error_code": "BUSY"}
@@ -218,7 +370,8 @@ def start_download(count: int) -> dict:
             "ok": True,
             "state": "starting",
             "requested": count,
-            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "workers": workers_n,
+            "started_at": _utc_now(),
         })
         venv_python = ROOT / ".venv" / "bin" / "python3"
         python = str(venv_python) if venv_python.is_file() else sys.executable
@@ -227,6 +380,8 @@ def start_download(count: int) -> dict:
             str(TOOLS / "fdroid_download.py"),
             "-n",
             str(count),
+            "-j",
+            str(workers_n),
             "-o",
             str(APKS_DIR),
             "--results",
@@ -248,8 +403,9 @@ def start_download(count: int) -> dict:
             "ok": code == 0,
             "state": "completed" if code == 0 else "failed",
             "requested": count,
+            "workers": workers_n,
             "exit_code": code,
-            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "finished_at": _utc_now(),
             "apk_count": len(list(APKS_DIR.glob("*.apk"))) if APKS_DIR.is_dir() else 0,
         })
 
@@ -258,9 +414,226 @@ def start_download(count: int) -> dict:
         "ok": True,
         "state": "started",
         "requested": count,
+        "workers": workers_n,
         "pid": proc.pid,
         "config": cfg,
-        "message": f"Downloading {count} new APKs (skipping packages already on disk or scanned)",
+        "message": (
+            f"Downloading {count} new APKs with {workers_n} parallel workers "
+            "(skipping packages already on disk or scanned)"
+        ),
+    }
+
+
+def _loop_worker() -> None:
+    cycle = int(load_loop_status().get("cycle") or 0)
+    while not _LOOP_STOP.is_set():
+        cfg = load_config()
+        if not cfg.get("loop_enabled"):
+            break
+        apps = int(cfg.get("loop_apps") or 100)
+        threads_n = int(cfg.get("loop_threads") or cfg.get("threads") or 12)
+        workers_n = int(cfg.get("loop_download_workers") or cfg.get("download_workers") or 10)
+        cycle += 1
+        _write_loop_status({
+            "ok": True,
+            "enabled": True,
+            "running": True,
+            "state": "running",
+            "phase": "downloading",
+            "cycle": cycle,
+            "apps": apps,
+            "threads": threads_n,
+            "download_workers": workers_n,
+            "message": f"Cycle {cycle}: downloading {apps} APKs ({workers_n} workers)",
+            "updated_at": _utc_now(),
+        })
+
+        # Wait if a manual download is still finishing.
+        _wait_until(lambda: not _download_process_alive(), poll=2.0)
+        if _LOOP_STOP.is_set():
+            break
+        dl = start_download(apps, workers=workers_n)
+        if not dl.get("ok") and dl.get("error_code") != "BUSY":
+            _write_loop_status({
+                "ok": False,
+                "enabled": True,
+                "running": True,
+                "state": "running",
+                "phase": "download_error",
+                "cycle": cycle,
+                "apps": apps,
+                "threads": threads_n,
+                "download_workers": workers_n,
+                "message": f"Cycle {cycle}: download failed — {dl.get('error')}",
+                "updated_at": _utc_now(),
+            })
+            _LOOP_STOP.wait(10.0)
+            continue
+        _wait_until(lambda: not _download_process_alive(), poll=2.0)
+        if _LOOP_STOP.is_set():
+            break
+
+        selected = 0
+        downloaded = 0
+        manifest = APKS_DIR / "fdroid-manifest.json"
+        if manifest.is_file():
+            try:
+                man = json.loads(manifest.read_text(encoding="utf-8"))
+                selected = int(man.get("selected") or 0)
+                downloaded = int(man.get("downloaded") or 0)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        _write_loop_status({
+            "ok": True,
+            "enabled": True,
+            "running": True,
+            "state": "running",
+            "phase": "scanning",
+            "cycle": cycle,
+            "apps": apps,
+            "threads": threads_n,
+            "download_workers": workers_n,
+            "message": (
+                f"Cycle {cycle}: scanning with {threads_n} threads "
+                f"(downloaded {downloaded}/{selected})"
+            ),
+            "updated_at": _utc_now(),
+        })
+        scan = start_scan(threads_n)
+        if not scan.get("ok"):
+            _write_loop_status({
+                "ok": False,
+                "enabled": True,
+                "running": True,
+                "state": "running",
+                "phase": "scan_error",
+                "cycle": cycle,
+                "apps": apps,
+                "threads": threads_n,
+                "download_workers": workers_n,
+                "message": f"Cycle {cycle}: scan failed — {scan.get('error')}",
+                "updated_at": _utc_now(),
+            })
+            _LOOP_STOP.wait(10.0)
+            continue
+
+        # Give the scanner a moment to flip status.json to running.
+        time.sleep(2.0)
+        _wait_until(lambda: not _scan_process_alive(), poll=3.0)
+        if _LOOP_STOP.is_set():
+            break
+
+        backoff = 30.0 if selected == 0 else 3.0
+        _write_loop_status({
+            "ok": True,
+            "enabled": True,
+            "running": True,
+            "state": "running",
+            "phase": "cycle_done",
+            "cycle": cycle,
+            "apps": apps,
+            "threads": threads_n,
+            "download_workers": workers_n,
+            "message": (
+                f"Cycle {cycle} complete"
+                + (" — no new apps, waiting before retry" if selected == 0 else " — starting next")
+            ),
+            "updated_at": _utc_now(),
+        })
+        # Brief pause between cycles so the UI can show cycle_done.
+        _LOOP_STOP.wait(backoff)
+
+    save_config({"loop_enabled": False})
+    _write_loop_status({
+        "ok": True,
+        "enabled": False,
+        "running": False,
+        "state": "stopped",
+        "phase": "idle",
+        "cycle": cycle,
+        "message": "Loop stopped",
+        "updated_at": _utc_now(),
+    })
+
+
+def start_loop(
+    apps: int | None = None,
+    threads: int | None = None,
+    download_workers: int | None = None,
+) -> dict:
+    global _LOOP_THREAD
+    patch: dict = {"loop_enabled": True}
+    if apps is not None:
+        patch["loop_apps"] = apps
+        patch["download_count"] = apps
+    if threads is not None:
+        patch["loop_threads"] = threads
+        patch["threads"] = threads
+    if download_workers is not None:
+        patch["loop_download_workers"] = download_workers
+        patch["download_workers"] = download_workers
+    cfg = save_config(patch)
+
+    with _STATE_LOCK:
+        if _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set():
+            return {
+                "ok": True,
+                "state": "already_running",
+                "config": cfg,
+                "loop": load_loop_status(),
+                "message": "Loop already running — settings updated for next cycle",
+            }
+        _LOOP_STOP.clear()
+        _write_loop_status({
+            "ok": True,
+            "enabled": True,
+            "running": True,
+            "state": "starting",
+            "phase": "starting",
+            "cycle": int(load_loop_status().get("cycle") or 0),
+            "apps": cfg["loop_apps"],
+            "threads": cfg["loop_threads"],
+            "download_workers": cfg["loop_download_workers"],
+            "message": "Starting auto loop",
+            "updated_at": _utc_now(),
+        })
+        _LOOP_THREAD = threading.Thread(target=_loop_worker, name="auto-loop", daemon=True)
+        _LOOP_THREAD.start()
+
+    return {
+        "ok": True,
+        "state": "started",
+        "config": cfg,
+        "loop": load_loop_status(),
+        "message": (
+            f"Auto loop started: {cfg['loop_apps']} apps/cycle, "
+            f"{cfg['loop_threads']} scan threads, "
+            f"{cfg['loop_download_workers']} download workers"
+        ),
+    }
+
+
+def stop_loop() -> dict:
+    save_config({"loop_enabled": False})
+    _LOOP_STOP.set()
+    # Do not kill an in-flight scan/download immediately — let the current
+    # phase finish unless the user separately stops them. Mark status stopped.
+    _write_loop_status({
+        **load_loop_status(),
+        "ok": True,
+        "enabled": False,
+        "running": False,
+        "state": "stopping",
+        "phase": "stopping",
+        "message": "Stop requested — finishing current phase",
+        "updated_at": _utc_now(),
+    })
+    return {
+        "ok": True,
+        "state": "stopping",
+        "loop": load_loop_status(),
+        "message": "Loop stop requested",
     }
 
 
@@ -378,12 +751,7 @@ def _iter_result_jobs(status_jobs: list | None = None) -> list[dict]:
             jobs.append((float(idx), dict(job)))
     if RESULTS_DIR.is_dir():
         for path in RESULTS_DIR.glob("*.json"):
-            if path.name in {
-                "status.json",
-                "summary.json",
-                "dashboard-config.json",
-                "download-status.json",
-            }:
+            if path.name in _META_SKIP:
                 continue
             try:
                 job = json.loads(path.read_text(encoding="utf-8"))
@@ -434,12 +802,7 @@ def _results_cache_key() -> tuple:
     count = 0
     if RESULTS_DIR.is_dir():
         for path in RESULTS_DIR.glob("*.json"):
-            if path.name in {
-                "status.json",
-                "summary.json",
-                "dashboard-config.json",
-                "download-status.json",
-            }:
+            if path.name in _META_SKIP:
                 continue
             count += 1
             try:
@@ -631,6 +994,7 @@ class StatusHandler(BaseHTTPRequestHandler):
             data = load_status(self.status_path)
             data["system"] = system_stats()
             data["config"] = load_config()
+            data["loop"] = load_loop_status()
             self._json(data)
             return
 
@@ -640,6 +1004,10 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path == "/api/system":
             self._json(system_stats())
+            return
+
+        if path in ("/api/loop", "/api/loop/status"):
+            self._json({"ok": True, "loop": load_loop_status(), "config": load_config()})
             return
 
         if path == "/api/config":
@@ -713,6 +1081,8 @@ class StatusHandler(BaseHTTPRequestHandler):
                     "/api/download",
                     "/api/apks/clear",
                     "/api/threads",
+                    "/api/loop",
+                    "/api/loop/stop",
                     "/apkleaks-skills/dashboard",
                 ],
             },
@@ -724,16 +1094,22 @@ class StatusHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
 
         if path in ("/api/download", "/api/download/start"):
-            count = body.get("count", load_config().get("download_count", 100))
+            cfg = load_config()
+            count = body.get("count", cfg.get("download_count", 100))
+            workers = body.get("workers", body.get("download_workers", cfg.get("download_workers", 10)))
             try:
                 count = int(count)
+                workers = int(workers)
             except (TypeError, ValueError):
-                self._json({"ok": False, "error": "count must be an integer"}, 400)
+                self._json({"ok": False, "error": "count/workers must be integers"}, 400)
                 return
             if count < 1:
                 self._json({"ok": False, "error": "count must be >= 1"}, 400)
                 return
-            self._json(start_download(count))
+            if workers < 1 or workers > 32:
+                self._json({"ok": False, "error": "workers must be 1..32"}, 400)
+                return
+            self._json(start_download(count, workers=workers))
             return
 
         if path in ("/api/apks/clear", "/api/download/clear"):
@@ -757,6 +1133,37 @@ class StatusHandler(BaseHTTPRequestHandler):
                 self._json(result)
             else:
                 self._json({"ok": True, "config": cfg, "message": "Threads saved (scan not restarted)"})
+            return
+
+        if path in ("/api/loop", "/api/loop/start"):
+            cfg = load_config()
+            apps = body.get("apps", body.get("loop_apps", cfg.get("loop_apps", 100)))
+            threads = body.get("threads", body.get("loop_threads", cfg.get("loop_threads", 12)))
+            workers = body.get(
+                "download_workers",
+                body.get("loop_download_workers", cfg.get("loop_download_workers", 10)),
+            )
+            try:
+                apps = int(apps)
+                threads = int(threads)
+                workers = int(workers)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "apps/threads/download_workers must be integers"}, 400)
+                return
+            if apps < 1 or apps > 5000:
+                self._json({"ok": False, "error": "apps must be 1..5000"}, 400)
+                return
+            if threads < 1 or threads > 32:
+                self._json({"ok": False, "error": "threads must be 1..32"}, 400)
+                return
+            if workers < 1 or workers > 32:
+                self._json({"ok": False, "error": "download_workers must be 1..32"}, 400)
+                return
+            self._json(start_loop(apps=apps, threads=threads, download_workers=workers))
+            return
+
+        if path in ("/api/loop/stop",):
+            self._json(stop_loop())
             return
 
         if path == "/api/config":
@@ -791,15 +1198,19 @@ def main() -> int:
     StatusHandler.status_path = Path(args.status)
     # Warm results cache in the background so first UI poll stays snappy.
     threading.Thread(target=_warm_results_cache, name="warm-results-cache", daemon=True).start()
+    # Resume auto-loop if it was left enabled across a dashboard restart.
+    if load_config().get("loop_enabled"):
+        start_loop()
     server = ThreadingHTTPServer((args.host, args.port), StatusHandler)
     print(f"Dashboard API listening on http://{args.host}:{args.port}")
     print(f"Status file: {StatusHandler.status_path}")
-    print("GET /api/status /api/system /api/results /api/results.txt")
-    print("POST /api/download  /api/apks/clear  /api/threads")
+    print("GET /api/status /api/system /api/results /api/results.txt /api/loop")
+    print("POST /api/download  /api/apks/clear  /api/threads  /api/loop  /api/loop/stop")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+        stop_loop()
     return 0
 
 

@@ -11,6 +11,7 @@ import random
 import re
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -128,11 +129,11 @@ def select_packages(
             "size": ver.get("size"),
         })
     if not candidates:
-        raise RuntimeError("No downloadable packages found in F-Droid index")
+        return []
 
     rng = random.Random(seed)
     rng.shuffle(candidates)
-    return candidates[: max(1, count)]
+    return candidates[: max(1, count)] if count > 0 else []
 
 
 def download_apk(meta: dict, out_dir: Path, overwrite: bool = False) -> Path:
@@ -156,6 +157,7 @@ def run(
     seed: int | None = None,
     overwrite: bool = False,
     results_dir: Path | None = None,
+    workers: int = 1,
 ) -> dict:
     index = load_index()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,17 +176,53 @@ def run(
         exclude_names=exclude_names,
         exclude_packages=exclude_pkgs,
     )
-    results = []
+    results: list[dict] = []
     skipped_existing = len(exclude_names)
     skipped_packages = len(exclude_pkgs)
-    iterator = tqdm(selected, desc="Downloading APKs", unit="apk") if tqdm else selected
-    for meta in iterator:
+    workers_n = max(1, min(32, int(workers or 1)))
+    if not selected:
+        LOG.warning("No new packages to download (all skipped or index empty)")
+        summary = {
+            "ok": True,
+            "requested": count,
+            "selected": 0,
+            "downloaded": 0,
+            "failed": 0,
+            "skipped_existing": skipped_existing,
+            "skipped_packages": skipped_packages,
+            "workers": workers_n,
+            "output_dir": str(out_dir),
+            "apps": [],
+        }
+        (out_dir / "fdroid-manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+    LOG.info("Downloading %s APK(s) with %s parallel worker(s)", len(selected), workers_n)
+
+    def _one(meta: dict) -> dict:
         try:
             path = download_apk(meta, out_dir, overwrite=overwrite)
-            results.append({**meta, "ok": True, "path": str(path), "skipped_duplicate": False})
+            return {**meta, "ok": True, "path": str(path), "skipped_duplicate": False}
         except (HTTPError, URLError, OSError, TimeoutError) as exc:
             LOG.error("Failed %s: %s", meta["packageName"], exc)
-            results.append({**meta, "ok": False, "error": str(exc)})
+            return {**meta, "ok": False, "error": str(exc)}
+
+    progress = tqdm(total=len(selected), desc="Downloading APKs", unit="apk") if tqdm else None
+    try:
+        if workers_n == 1:
+            for meta in selected:
+                results.append(_one(meta))
+                if progress is not None:
+                    progress.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=workers_n) as pool:
+                futures = {pool.submit(_one, meta): meta for meta in selected}
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+                    if progress is not None:
+                        progress.update(1)
+    finally:
+        if progress is not None:
+            progress.close()
 
     summary = {
         "ok": True,
@@ -194,6 +232,7 @@ def run(
         "failed": sum(1 for r in results if not r.get("ok")),
         "skipped_existing": skipped_existing,
         "skipped_packages": skipped_packages,
+        "workers": workers_n,
         "output_dir": str(out_dir),
         "apps": results,
     }
@@ -225,6 +264,13 @@ def main() -> int:
     )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible selection")
     parser.add_argument("--overwrite", action="store_true", help="Re-download even if file exists")
+    parser.add_argument(
+        "-j",
+        "--workers",
+        type=int,
+        default=10,
+        help="Parallel download threads (default: 10, max 32)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -237,6 +283,9 @@ def main() -> int:
     if args.count < 1:
         LOG.error("count must be >= 1")
         return 2
+    if args.workers < 1 or args.workers > 32:
+        LOG.error("workers must be 1..32")
+        return 2
 
     try:
         summary = run(
@@ -245,6 +294,7 @@ def main() -> int:
             seed=args.seed,
             overwrite=args.overwrite,
             results_dir=Path(args.results) if args.results else None,
+            workers=args.workers,
         )
     except Exception as exc:  # noqa: BLE001
         LOG.error("%s", exc)
@@ -256,6 +306,7 @@ def main() -> int:
         "downloaded": summary["downloaded"],
         "failed": summary["failed"],
         "skipped_packages": summary.get("skipped_packages", 0),
+        "workers": summary.get("workers", 1),
         "output_dir": summary["output_dir"],
     }, indent=2))
     return 0 if summary["failed"] == 0 else 1

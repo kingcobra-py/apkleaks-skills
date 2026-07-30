@@ -27,6 +27,9 @@ import {
   DashboardOutlined,
   HddOutlined,
   DeleteOutlined,
+  RetweetOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
 } from '@ant-design/icons';
 import { motion } from 'framer-motion';
 
@@ -44,6 +47,26 @@ type Job = {
   raw_lines?: string[];
   aws_pairs?: string[];
 };
+type Config = {
+  threads?: number;
+  download_count?: number;
+  download_workers?: number;
+  loop_enabled?: boolean;
+  loop_apps?: number;
+  loop_threads?: number;
+  loop_download_workers?: number;
+};
+type LoopStatus = {
+  enabled?: boolean;
+  running?: boolean;
+  state?: string;
+  phase?: string;
+  cycle?: number;
+  apps?: number;
+  threads?: number;
+  download_workers?: number;
+  message?: string;
+};
 type SystemStats = {
   cpu_percent?: number;
   memory?: {
@@ -54,7 +77,9 @@ type SystemStats = {
   apk_count?: number;
   download_running?: boolean;
   scan_running?: boolean;
-  config?: { threads?: number; download_count?: number };
+  loop_running?: boolean;
+  loop?: LoopStatus;
+  config?: Config;
 };
 type ActiveApp = {
   apk: string;
@@ -92,7 +117,8 @@ type Status = {
   other_lines?: string[];
   aws_pairs?: string[];
   system?: SystemStats;
-  config?: { threads?: number; download_count?: number };
+  config?: Config;
+  loop?: LoopStatus;
 };
 
 const PHASE_COLOR: Record<string, string> = {
@@ -148,7 +174,7 @@ const DEMO: Status = {
     apk_count: 99,
     download_running: false,
     scan_running: true,
-    config: { threads: 4, download_count: 100 },
+    config: { threads: 4, download_count: 100, download_workers: 10, loop_apps: 100, loop_threads: 12 },
   },
 };
 
@@ -185,10 +211,15 @@ const DashboardPage: React.FC = () => {
   const [status, setStatus] = useState<Status | null>(null);
   const [source, setSource] = useState<'loading' | 'demo' | 'live'>('loading');
   const [downloadCount, setDownloadCount] = useState<number>(100);
+  const [downloadWorkers, setDownloadWorkers] = useState<number>(10);
   const [threads, setThreads] = useState<number>(4);
+  const [loopApps, setLoopApps] = useState<number>(100);
+  const [loopThreads, setLoopThreads] = useState<number>(12);
+  const [loopDownloadWorkers, setLoopDownloadWorkers] = useState<number>(10);
   const [busyDownload, setBusyDownload] = useState(false);
   const [busyClear, setBusyClear] = useState(false);
   const [busyThreads, setBusyThreads] = useState(false);
+  const [busyLoop, setBusyLoop] = useState(false);
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
   const sawLiveRef = useRef(false);
@@ -201,7 +232,11 @@ const DashboardPage: React.FC = () => {
     ]);
     setOtherLines(['example_other_api_token_value_123456']);
     setDownloadCount(DEMO.system?.config?.download_count ?? 100);
+    setDownloadWorkers(DEMO.system?.config?.download_workers ?? 10);
     setThreads(DEMO.threads ?? 4);
+    setLoopApps(DEMO.system?.config?.loop_apps ?? 100);
+    setLoopThreads(DEMO.system?.config?.loop_threads ?? 12);
+    setLoopDownloadWorkers(DEMO.system?.config?.download_workers ?? 10);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -217,9 +252,15 @@ const DashboardPage: React.FC = () => {
     if (!isDemo) sawLiveRef.current = true;
     setStatus(data);
     setSource(isDemo ? 'demo' : 'live');
-    if (data.config?.download_count) setDownloadCount(data.config.download_count);
-    if (data.config?.threads) setThreads(data.config.threads);
+    const cfg = data.config || data.system?.config;
+    if (cfg?.download_count) setDownloadCount(cfg.download_count);
+    if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
+    if (cfg?.threads) setThreads(cfg.threads);
     else if (data.threads) setThreads(data.threads);
+    if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
+    if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
+    if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
+    else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
 
     // Prefer dedicated results endpoint; fall back to status payload so Priority
     // / Other never briefly clear when /api/results is slow.
@@ -257,7 +298,7 @@ const DashboardPage: React.FC = () => {
       const res = await apiFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ count: downloadCount }),
+        body: JSON.stringify({ count: downloadCount, workers: downloadWorkers }),
       });
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
@@ -321,6 +362,50 @@ const DashboardPage: React.FC = () => {
     }
   };
 
+  const onStartLoop = async () => {
+    setBusyLoop(true);
+    try {
+      const res = await apiFetch('/api/loop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apps: loopApps,
+          threads: loopThreads,
+          download_workers: loopDownloadWorkers,
+        }),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to start loop');
+      } else {
+        message.success(data.message || 'Auto loop started');
+      }
+      await refresh();
+    } finally {
+      setBusyLoop(false);
+    }
+  };
+
+  const onStopLoop = async () => {
+    setBusyLoop(true);
+    try {
+      const res = await apiFetch('/api/loop/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to stop loop');
+      } else {
+        message.success(data.message || 'Loop stop requested');
+      }
+      await refresh();
+    } finally {
+      setBusyLoop(false);
+    }
+  };
+
   const downloadText = (filename: string, text: string) => {
     const body = text.endsWith('\n') || !text ? text : `${text}\n`;
     const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
@@ -352,6 +437,8 @@ const DashboardPage: React.FC = () => {
   const sys = view.system;
   const cpu = sys?.cpu_percent ?? 0;
   const mem = sys?.memory?.percent ?? 0;
+  const loop = view.loop || sys?.loop;
+  const loopRunning = Boolean(loop?.running || sys?.loop_running);
   const activeApps = useMemo(() => {
     const map = view.active || {};
     const list = Object.values(map);
@@ -420,10 +507,11 @@ const DashboardPage: React.FC = () => {
           </Tag>
           {sys?.download_running ? <Tag color="blue">DOWNLOADING</Tag> : null}
           {sys?.scan_running ? <Tag color="cyan">SCANNING</Tag> : null}
+          {loopRunning ? <Tag color="purple">LOOP CYCLE {loop?.cycle ?? ''}</Tag> : null}
         </Space>
         <Paragraph type="secondary" style={{ maxWidth: 760 }}>
-          Download unique F-Droid APKs, control scan threads, watch CPU/RAM, and export raw secrets (AWS as{' '}
-          <Text code>AwsKey:AwsSecretKey</Text>).
+          Download unique F-Droid APKs in parallel, control scan threads, run an automatic download→scan
+          loop, and export raw secrets (AWS as <Text code>AwsKey:AwsSecretKey</Text>).
         </Paragraph>
       </motion.div>
 
@@ -460,6 +548,16 @@ const DashboardPage: React.FC = () => {
                   style={{ width: '100%', marginTop: 8 }}
                 />
               </div>
+              <div>
+                <Text type="secondary">Download threads (parallel at once)</Text>
+                <InputNumber
+                  min={1}
+                  max={32}
+                  value={downloadWorkers}
+                  onChange={(v) => setDownloadWorkers(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                />
+              </div>
               <Button type="primary" block loading={busyDownload} icon={<CloudDownloadOutlined />} onClick={onDownload}>
                 Start download
               </Button>
@@ -469,7 +567,7 @@ const DashboardPage: React.FC = () => {
                 loading={busyClear}
                 icon={<DeleteOutlined />}
                 onClick={onClearApks}
-                disabled={Boolean(sys?.download_running || sys?.scan_running)}
+                disabled={Boolean(sys?.download_running || sys?.scan_running || loopRunning)}
               >
                 Remove downloaded APKs
               </Button>
@@ -490,7 +588,14 @@ const DashboardPage: React.FC = () => {
                   style={{ width: '100%', marginTop: 8 }}
                 />
               </div>
-              <Button type="primary" block loading={busyThreads} icon={<ThunderboltOutlined />} onClick={onApplyThreads}>
+              <Button
+                type="primary"
+                block
+                loading={busyThreads}
+                icon={<ThunderboltOutlined />}
+                onClick={onApplyThreads}
+                disabled={loopRunning}
+              >
                 Apply & restart scan
               </Button>
               <Text type="secondary">Active setting: {view.threads ?? threads}</Text>
@@ -510,6 +615,86 @@ const DashboardPage: React.FC = () => {
                 </Text>
                 <Progress percent={Math.min(100, Number(mem) || 0)} strokeColor="#38bdf8" />
               </div>
+            </Space>
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <RetweetOutlined spin={loopRunning} />
+                Auto loop cycle
+                {loopRunning ? <Tag color="purple">RUNNING</Tag> : <Tag>IDLE</Tag>}
+                {loop?.cycle ? <Tag color="processing">cycle {loop.cycle}</Tag> : null}
+              </Space>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              Automatically downloads a batch, scans it, then repeats. Set apps per cycle, scan threads, and
+              parallel download workers.
+            </Paragraph>
+            <Row gutter={[16, 16]}>
+              <Col xs={24} md={8}>
+                <Text type="secondary">Apps per cycle</Text>
+                <InputNumber
+                  min={1}
+                  max={5000}
+                  value={loopApps}
+                  onChange={(v) => setLoopApps(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                  disabled={loopRunning}
+                />
+              </Col>
+              <Col xs={24} md={8}>
+                <Text type="secondary">Scan threads</Text>
+                <InputNumber
+                  min={1}
+                  max={32}
+                  value={loopThreads}
+                  onChange={(v) => setLoopThreads(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                  disabled={loopRunning}
+                />
+              </Col>
+              <Col xs={24} md={8}>
+                <Text type="secondary">Download threads</Text>
+                <InputNumber
+                  min={1}
+                  max={32}
+                  value={loopDownloadWorkers}
+                  onChange={(v) => setLoopDownloadWorkers(Number(v || 1))}
+                  style={{ width: '100%', marginTop: 8 }}
+                  disabled={loopRunning}
+                />
+              </Col>
+            </Row>
+            <Space wrap style={{ marginTop: 16 }}>
+              <Button
+                type="primary"
+                loading={busyLoop}
+                icon={<PlayCircleOutlined />}
+                onClick={onStartLoop}
+                disabled={loopRunning}
+              >
+                Start auto loop
+              </Button>
+              <Button
+                danger
+                loading={busyLoop}
+                icon={<PauseCircleOutlined />}
+                onClick={onStopLoop}
+                disabled={!loopRunning && loop?.state !== 'stopping'}
+              >
+                Stop loop
+              </Button>
+              <Tag color={loop?.phase === 'scanning' ? 'cyan' : loop?.phase === 'downloading' ? 'blue' : 'default'}>
+                phase: {loop?.phase || 'idle'}
+              </Tag>
+              <Text type="secondary">{loop?.message || 'Loop idle'}</Text>
             </Space>
           </Card>
         </Col>

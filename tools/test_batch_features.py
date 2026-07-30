@@ -153,6 +153,51 @@ class FdroidDedupTests(unittest.TestCase):
         names = {s["packageName"] for s in selected}
         self.assertEqual(names, {"com.keep.me"})
 
+    def test_select_packages_empty_when_all_excluded(self):
+        index = {
+            "apps": [{"packageName": "com.skip.me", "name": "Skip"}],
+            "packages": {
+                "com.skip.me": [{"apkName": "com.skip.me_2.apk", "versionName": "2"}],
+            },
+        }
+        selected = select_packages(index, count=5, exclude_packages={"com.skip.me"})
+        self.assertEqual(selected, [])
+
+    def test_parallel_download_workers(self):
+        import fdroid_download as fd
+
+        index = {
+            "apps": [
+                {"packageName": f"com.app{i}", "name": f"App{i}"} for i in range(4)
+            ],
+            "packages": {
+                f"com.app{i}": [{"apkName": f"com.app{i}_1.apk", "versionName": "1"}]
+                for i in range(4)
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            seen: list[str] = []
+
+            def fake_download(meta, out_dir, overwrite=False):
+                seen.append(meta["packageName"])
+                target = out_dir / meta["apkName"]
+                target.write_bytes(b"apk")
+                return target
+
+            original_load = fd.load_index
+            original_dl = fd.download_apk
+            fd.load_index = lambda: index  # type: ignore[assignment]
+            fd.download_apk = fake_download  # type: ignore[assignment]
+            try:
+                summary = fd.run(count=4, out_dir=out, workers=3, overwrite=True)
+            finally:
+                fd.load_index = original_load  # type: ignore[assignment]
+                fd.download_apk = original_dl  # type: ignore[assignment]
+            self.assertEqual(summary["downloaded"], 4)
+            self.assertEqual(summary["workers"], 3)
+            self.assertEqual(len(seen), 4)
+
 
 class ResultsFormatTests(unittest.TestCase):
     def test_aws_pair_format(self):
