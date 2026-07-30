@@ -478,7 +478,6 @@ def load_status(status_path: Path) -> dict:
                 with _STATE_LOCK:
                     alive = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
                 if data.get("state") == "running" and not alive:
-                    # Also check OS for an orphaned batch_scan started outside this server.
                     try:
                         out = subprocess.check_output(
                             ["pgrep", "-f", "tools/batch_scan.py"],
@@ -493,14 +492,13 @@ def load_status(status_path: Path) -> dict:
                     data["current"] = []
                     data["scan_dead"] = True
 
-                agg = _cached_aggregate(data.get("jobs") or [])
-                data["raw_lines"] = agg["lines"]
-                data["priority_lines"] = agg.get("priority_lines") or []
-                data["other_lines"] = agg.get("other_lines") or []
-                data["aws_pairs"] = agg["aws_pairs"]
+                # Keep /api/status fast: do NOT re-read every per-APK JSON here.
+                # Full merge happens in collect_results() with a cache.
+                data.setdefault("priority_lines", [])
+                data.setdefault("other_lines", [])
+                data.setdefault("raw_lines", list(data.get("priority_lines") or []) + list(data.get("other_lines") or []))
+                data.setdefault("aws_pairs", [])
                 data["counts"] = data.get("counts") or {}
-                data["counts"]["findings"] = len(agg["lines"])
-                data["counts"]["has_aws"] = len(agg["aws_pairs"])
                 data["demo"] = False
                 return data
         except json.JSONDecodeError:
@@ -523,6 +521,20 @@ def collect_results(status_path: Path) -> dict:
     agg["other_text"] = "\n".join(agg.get("other_lines") or []) + (
         "\n" if agg.get("other_lines") else ""
     )
+    # Refresh status-facing lines from the authoritative merge.
+    try:
+        if status_path.is_file():
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data["priority_lines"] = agg.get("priority_lines") or []
+                data["other_lines"] = agg.get("other_lines") or []
+                data["raw_lines"] = agg.get("lines") or []
+                data["aws_pairs"] = agg.get("aws_pairs") or []
+                tmp = status_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                tmp.replace(status_path)
+    except Exception:  # noqa: BLE001
+        pass
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (RESULTS_DIR / "results.txt").write_text(agg["text"], encoding="utf-8")
     (RESULTS_DIR / "priority-results.txt").write_text(agg["priority_text"], encoding="utf-8")
