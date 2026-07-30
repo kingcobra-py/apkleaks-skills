@@ -5,6 +5,7 @@ import {
   Card,
   Col,
   InputNumber,
+  Modal,
   Progress,
   Row,
   Space,
@@ -25,6 +26,7 @@ import {
   DownloadOutlined,
   DashboardOutlined,
   HddOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons';
 import { motion } from 'framer-motion';
 
@@ -185,6 +187,7 @@ const DashboardPage: React.FC = () => {
   const [downloadCount, setDownloadCount] = useState<number>(100);
   const [threads, setThreads] = useState<number>(4);
   const [busyDownload, setBusyDownload] = useState(false);
+  const [busyClear, setBusyClear] = useState(false);
   const [busyThreads, setBusyThreads] = useState(false);
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
@@ -266,6 +269,36 @@ const DashboardPage: React.FC = () => {
     } finally {
       setBusyDownload(false);
     }
+  };
+
+  const onClearApks = () => {
+    Modal.confirm({
+      title: 'Remove downloaded APKs?',
+      content:
+        'Deletes every .apk in the download folder. Scan results (Priority / Other) are kept. Packages already scanned stay skipped on the next download.',
+      okText: 'Delete APKs',
+      okButtonProps: { danger: true },
+      cancelText: 'Cancel',
+      onOk: async () => {
+        setBusyClear(true);
+        try {
+          const res = await apiFetch('/api/apks/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          const data = res ? await res.json() : null;
+          if (!res || !data?.ok) {
+            message.error(data?.error || 'Failed to remove APKs');
+          } else {
+            message.success(data.message || `Removed ${data.removed ?? 0} APKs`);
+          }
+          await refresh();
+        } finally {
+          setBusyClear(false);
+        }
+      },
+    });
   };
 
   const onApplyThreads = async () => {
@@ -418,7 +451,7 @@ const DashboardPage: React.FC = () => {
           <Card className="glass-card" title={<Space><CloudDownloadOutlined /> Download APKs</Space>}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
               <div>
-                <Text type="secondary">Number of new APKs (skips duplicates)</Text>
+                <Text type="secondary">Number of new APKs (skips packages already downloaded or scanned)</Text>
                 <InputNumber
                   min={1}
                   max={5000}
@@ -429,6 +462,16 @@ const DashboardPage: React.FC = () => {
               </div>
               <Button type="primary" block loading={busyDownload} icon={<CloudDownloadOutlined />} onClick={onDownload}>
                 Start download
+              </Button>
+              <Button
+                danger
+                block
+                loading={busyClear}
+                icon={<DeleteOutlined />}
+                onClick={onClearApks}
+                disabled={Boolean(sys?.download_running || sys?.scan_running)}
+              >
+                Remove downloaded APKs
               </Button>
               <Text type="secondary">On disk: {sys?.apk_count ?? '—'} APKs</Text>
             </Space>

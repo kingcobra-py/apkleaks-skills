@@ -219,6 +219,8 @@ def start_download(count: int) -> dict:
             str(count),
             "-o",
             str(APKS_DIR),
+            "--results",
+            str(RESULTS_DIR),
         ]
         log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
         _DOWNLOAD_PROC = subprocess.Popen(
@@ -248,8 +250,48 @@ def start_download(count: int) -> dict:
         "requested": count,
         "pid": proc.pid,
         "config": cfg,
-        "message": f"Downloading {count} new APKs (skipping duplicates)",
+        "message": f"Downloading {count} new APKs (skipping packages already on disk or scanned)",
     }
+
+
+def clear_downloaded_apks() -> dict:
+    """Delete all .apk files from the APKs directory (keeps scan results)."""
+    global _DOWNLOAD_PROC
+    with _STATE_LOCK:
+        if _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None:
+            return {"ok": False, "error": "Download is running — stop it first", "error_code": "BUSY"}
+        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
+            return {"ok": False, "error": "Scan is running — stop it before deleting APKs", "error_code": "BUSY"}
+
+        APKS_DIR.mkdir(parents=True, exist_ok=True)
+        removed = 0
+        failed = 0
+        errors: list[str] = []
+        for path in sorted(APKS_DIR.glob("*.apk")):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"{path.name}: {exc}")
+        # Also drop partial downloads
+        for path in APKS_DIR.glob("*.apk.part"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        remaining = len(list(APKS_DIR.glob("*.apk")))
+        return {
+            "ok": failed == 0,
+            "removed": removed,
+            "failed": failed,
+            "remaining": remaining,
+            "errors": errors,
+            "message": f"Removed {removed} downloaded APK(s)" + (f"; {failed} failed" if failed else ""),
+        }
 
 
 def start_scan(threads: int | None = None) -> dict:
@@ -556,6 +598,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                     "/api/results",
                     "/api/results.txt",
                     "/api/download",
+                    "/api/apks/clear",
                     "/api/threads",
                     "/apkleaks-skills/dashboard",
                 ],
@@ -578,6 +621,10 @@ class StatusHandler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "count must be >= 1"}, 400)
                 return
             self._json(start_download(count))
+            return
+
+        if path in ("/api/apks/clear", "/api/download/clear"):
+            self._json(clear_downloaded_apks())
             return
 
         if path in ("/api/threads", "/api/scan/start"):
@@ -633,7 +680,7 @@ def main() -> int:
     print(f"Dashboard API listening on http://{args.host}:{args.port}")
     print(f"Status file: {StatusHandler.status_path}")
     print("GET /api/status /api/system /api/results /api/results.txt")
-    print("POST /api/download  /api/threads")
+    print("POST /api/download  /api/apks/clear  /api/threads")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

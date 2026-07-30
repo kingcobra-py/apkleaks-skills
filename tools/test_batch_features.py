@@ -21,6 +21,12 @@ from batch_scan import (  # noqa: E402
     SCAN_PCT_START,
     SCAN_PCT_END,
 )
+from fdroid_download import (  # noqa: E402
+    package_from_apk_name,
+    existing_package_names,
+    scanned_package_names,
+    select_packages,
+)
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
 
@@ -104,6 +110,48 @@ class FastScanTests(unittest.TestCase):
             self.assertEqual(progress[-1][0], progress[-1][1])
             # patterns.json itself is walked; at least the two text files + json
             self.assertGreaterEqual(progress[-1][1], 2)
+
+
+class FdroidDedupTests(unittest.TestCase):
+    def test_package_from_apk_name(self):
+        self.assertEqual(package_from_apk_name("com.foo.bar_12.apk"), "com.foo.bar")
+        self.assertEqual(package_from_apk_name("ac.mdiq.Podcini.A_83.apk"), "ac.mdiq.Podcini.A")
+        self.assertIsNone(package_from_apk_name("not-an-apk.txt"))
+
+    def test_existing_and_scanned_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apks = root / "apks"
+            results = root / "results"
+            apks.mkdir()
+            results.mkdir()
+            (apks / "com.demo.app_9.apk").write_bytes(b"apk")
+            (results / "org.scanned.one_3.json").write_text(
+                json.dumps({"apk": "org.scanned.one_3.apk", "ok": True}),
+                encoding="utf-8",
+            )
+            self.assertEqual(existing_package_names(apks), {"com.demo.app"})
+            self.assertEqual(scanned_package_names(results), {"org.scanned.one"})
+
+    def test_select_packages_skips_known_packages(self):
+        index = {
+            "apps": [
+                {"packageName": "com.keep.me", "name": "Keep"},
+                {"packageName": "com.skip.me", "name": "Skip"},
+            ],
+            "packages": {
+                "com.keep.me": [{"apkName": "com.keep.me_1.apk", "versionName": "1"}],
+                "com.skip.me": [{"apkName": "com.skip.me_2.apk", "versionName": "2"}],
+            },
+        }
+        selected = select_packages(
+            index,
+            count=10,
+            seed=1,
+            exclude_packages={"com.skip.me"},
+        )
+        names = {s["packageName"] for s in selected}
+        self.assertEqual(names, {"com.keep.me"})
 
 
 class ResultsFormatTests(unittest.TestCase):

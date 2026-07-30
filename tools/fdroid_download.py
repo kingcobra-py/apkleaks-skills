@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import random
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -24,6 +25,7 @@ LOG = logging.getLogger("fdroid_download")
 INDEX_URL = "https://f-droid.org/repo/index-v1.jar"
 REPO_BASE = "https://f-droid.org/repo/"
 USER_AGENT = "apkleaks-skills-fdroid-downloader/1.0 (+authorized security research)"
+_APK_NAME_RE = re.compile(r"^(.+)_(\d+)\.apk$", re.IGNORECASE)
 
 
 def _http_get(url: str, timeout: int = 120) -> bytes:
@@ -40,19 +42,75 @@ def load_index() -> dict:
             return json.load(fh)
 
 
+def package_from_apk_name(name: str) -> str | None:
+    """Extract package id from F-Droid style `package_versionCode.apk` names."""
+    m = _APK_NAME_RE.match(name.strip())
+    return m.group(1) if m else None
+
+
+def existing_apk_names(out_dir: Path) -> set[str]:
+    if not out_dir.is_dir():
+        return set()
+    return {p.name for p in out_dir.glob("*.apk") if p.is_file()}
+
+
+def existing_package_names(out_dir: Path) -> set[str]:
+    """Packages already present on disk (any version)."""
+    pkgs: set[str] = set()
+    for name in existing_apk_names(out_dir):
+        pkg = package_from_apk_name(name)
+        if pkg:
+            pkgs.add(pkg)
+    return pkgs
+
+
+def scanned_package_names(results_dir: Path | None) -> set[str]:
+    """Packages that already have a scan result JSON (any version)."""
+    if results_dir is None or not results_dir.is_dir():
+        return set()
+    skip = {
+        "status.json",
+        "summary.json",
+        "dashboard-config.json",
+        "download-status.json",
+    }
+    pkgs: set[str] = set()
+    for path in results_dir.glob("*.json"):
+        if path.name in skip:
+            continue
+        pkg = package_from_apk_name(path.name.replace(".json", ".apk"))
+        if pkg:
+            pkgs.add(pkg)
+            continue
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        apk = job.get("apk") if isinstance(job, dict) else None
+        if isinstance(apk, str):
+            p2 = package_from_apk_name(apk)
+            if p2:
+                pkgs.add(p2)
+    return pkgs
+
+
 def select_packages(
     index: dict,
     count: int,
     seed: int | None = None,
     exclude_names: set[str] | None = None,
+    exclude_packages: set[str] | None = None,
 ) -> list[dict]:
     apps = index.get("apps") or []
     packages = index.get("packages") or {}
     exclude = exclude_names or set()
+    exclude_pkgs = exclude_packages or set()
     candidates = []
     for app in apps:
         pkg = app.get("packageName")
         if not pkg or pkg not in packages:
+            continue
+        if pkg in exclude_pkgs:
             continue
         versions = packages[pkg]
         if not versions:
@@ -92,20 +150,33 @@ def download_apk(meta: dict, out_dir: Path, overwrite: bool = False) -> Path:
     return target
 
 
-def existing_apk_names(out_dir: Path) -> set[str]:
-    if not out_dir.is_dir():
-        return set()
-    return {p.name for p in out_dir.glob("*.apk") if p.is_file()}
-
-
-def run(count: int, out_dir: Path, seed: int | None = None, overwrite: bool = False) -> dict:
+def run(
+    count: int,
+    out_dir: Path,
+    seed: int | None = None,
+    overwrite: bool = False,
+    results_dir: Path | None = None,
+) -> dict:
     index = load_index()
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Skip duplicates: only select APKs not already on disk (unless overwrite)
-    exclude = set() if overwrite else existing_apk_names(out_dir)
-    selected = select_packages(index, count, seed=seed, exclude_names=exclude)
+    # Dedup by exact APK filename AND package id (any version already on disk
+    # or already scanned). Prevents re-downloading the same app under a new
+    # versionCode.
+    exclude_names: set[str] = set()
+    exclude_pkgs: set[str] = set()
+    if not overwrite:
+        exclude_names = existing_apk_names(out_dir)
+        exclude_pkgs = existing_package_names(out_dir) | scanned_package_names(results_dir)
+    selected = select_packages(
+        index,
+        count,
+        seed=seed,
+        exclude_names=exclude_names,
+        exclude_packages=exclude_pkgs,
+    )
     results = []
-    skipped_existing = len(exclude)
+    skipped_existing = len(exclude_names)
+    skipped_packages = len(exclude_pkgs)
     iterator = tqdm(selected, desc="Downloading APKs", unit="apk") if tqdm else selected
     for meta in iterator:
         try:
@@ -122,6 +193,7 @@ def run(count: int, out_dir: Path, seed: int | None = None, overwrite: bool = Fa
         "downloaded": sum(1 for r in results if r.get("ok")),
         "failed": sum(1 for r in results if not r.get("ok")),
         "skipped_existing": skipped_existing,
+        "skipped_packages": skipped_packages,
         "output_dir": str(out_dir),
         "apps": results,
     }
@@ -146,6 +218,11 @@ def main() -> int:
         default="apks",
         help="Output directory (default: apks)",
     )
+    parser.add_argument(
+        "--results",
+        default=None,
+        help="Results dir — skip packages already scanned there",
+    )
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible selection")
     parser.add_argument("--overwrite", action="store_true", help="Re-download even if file exists")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -162,7 +239,13 @@ def main() -> int:
         return 2
 
     try:
-        summary = run(args.count, Path(args.output), seed=args.seed, overwrite=args.overwrite)
+        summary = run(
+            args.count,
+            Path(args.output),
+            seed=args.seed,
+            overwrite=args.overwrite,
+            results_dir=Path(args.results) if args.results else None,
+        )
     except Exception as exc:  # noqa: BLE001
         LOG.error("%s", exc)
         return 1
@@ -172,6 +255,7 @@ def main() -> int:
         "requested": summary["requested"],
         "downloaded": summary["downloaded"],
         "failed": summary["failed"],
+        "skipped_packages": summary.get("skipped_packages", 0),
         "output_dir": summary["output_dir"],
     }, indent=2))
     return 0 if summary["failed"] == 0 else 1
