@@ -488,7 +488,7 @@ def run_batch(
     status = _empty_status(len(apks), threads, str(input_dir), str(output_dir))
     # Keep previously found secrets visible while a new scan starts.
     try:
-        seed_jobs: list[dict[str, Any]] = []
+        seed_jobs: list[tuple[float, dict[str, Any]]] = []
         for path in output_dir.glob("*.json"):
             if path.name in {"status.json", "summary.json", "dashboard-config.json", "download-status.json"}:
                 continue
@@ -497,9 +497,15 @@ def run_batch(
             except json.JSONDecodeError:
                 continue
             if isinstance(job, dict) and job.get("apk"):
-                seed_jobs.append(job)
-        if seed_jobs:
-            seeded = aggregate_results(seed_jobs)
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                seed_jobs.append((mtime, job))
+        seed_jobs.sort(key=lambda item: item[0], reverse=True)
+        ordered_seed = [job for _, job in seed_jobs]
+        if ordered_seed:
+            seeded = aggregate_results(ordered_seed)
             status["priority_lines"] = seeded.get("priority_lines") or []
             status["other_lines"] = seeded.get("other_lines") or []
             status["raw_lines"] = seeded.get("lines") or []
@@ -616,9 +622,16 @@ def run_batch(
             for line in job.get("priority_lines") or []:
                 if line not in status["priority_lines"]:
                     status["priority_lines"].append(line)
-            for line in job.get("other_lines") or []:
-                if line not in status["other_lines"] and line not in status["priority_lines"]:
-                    status["other_lines"].append(line)
+            # Newest finds first in Other APIs.
+            new_other = [
+                line
+                for line in (job.get("other_lines") or [])
+                if line
+                and line not in status["other_lines"]
+                and line not in status["priority_lines"]
+            ]
+            if new_other:
+                status["other_lines"] = new_other + list(status["other_lines"])
             status["raw_lines"] = list(status["priority_lines"]) + list(status["other_lines"])
             for pair in job.get("aws_pairs") or []:
                 if pair not in status["aws_pairs"]:
@@ -713,18 +726,25 @@ def run_batch(
     status["finished_at"] = _utc_now()
     status["active"] = {}
     status["current"] = []
-    agg = aggregate_results(status["jobs"])
-    # Prefer full per-apk files for final aggregation when available
-    disk_jobs = []
+    agg = aggregate_results(list(reversed(status["jobs"])))
+    # Prefer full per-apk files for final aggregation when available (newest first).
+    disk_jobs: list[tuple[float, dict[str, Any]]] = []
     for path in output_dir.glob("*.json"):
         if path.name in {"status.json", "summary.json", "dashboard-config.json", "download-status.json"}:
             continue
         try:
-            disk_jobs.append(json.loads(path.read_text(encoding="utf-8")))
+            job = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
+        if isinstance(job, dict) and job.get("apk"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            disk_jobs.append((mtime, job))
     if disk_jobs:
-        agg = aggregate_results(disk_jobs)
+        disk_jobs.sort(key=lambda item: item[0], reverse=True)
+        agg = aggregate_results([job for _, job in disk_jobs])
     status["raw_lines"] = agg["lines"]
     status["priority_lines"] = agg.get("priority_lines") or []
     status["other_lines"] = agg.get("other_lines") or []

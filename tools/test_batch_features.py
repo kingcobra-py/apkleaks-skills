@@ -265,6 +265,30 @@ class ResultsFormatTests(unittest.TestCase):
         self.assertEqual(agg["other_total"], 1)
         self.assertNotIn("ads.s3.amazonaws.com", agg["lines"])
 
+    def test_aggregate_other_newest_first(self):
+        # Callers pass jobs newest-first; Other APIs should keep that order.
+        jobs = [
+            {
+                "apk": "new.apk",
+                "priority_lines": [],
+                "other_lines": ["Generic_API_Key: newest_token_value_aaa"],
+                "aws_pairs": [],
+            },
+            {
+                "apk": "old.apk",
+                "priority_lines": [],
+                "other_lines": ["Generic_API_Key: oldest_token_value_zzz"],
+                "aws_pairs": [],
+            },
+        ]
+        agg = aggregate_results(jobs)
+        self.assertEqual(
+            agg["other_lines"],
+            [
+                "Generic_API_Key: newest_token_value_aaa",
+                "Generic_API_Key: oldest_token_value_zzz",
+            ],
+        )
 
 if __name__ == "__main__":
     unittest.main()

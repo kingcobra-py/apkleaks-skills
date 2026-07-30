@@ -322,13 +322,17 @@ def aggregate_results(jobs: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         if job.get("findings") or job.get("results"):
             norm = normalize_job_findings(job)
-        elif job.get("raw_lines") or job.get("aws_pairs") or job.get("priority_lines"):
-            lines = job.get("priority_lines") or job.get("raw_lines") or []
+        elif (
+            job.get("raw_lines")
+            or job.get("aws_pairs")
+            or job.get("priority_lines") is not None
+            or job.get("other_lines") is not None
+        ):
             # If both priority/other already present, prefer them
             if job.get("priority_lines") is not None or job.get("other_lines") is not None:
                 norm = {
                     "priority_lines": [x for x in (job.get("priority_lines") or []) if x],
-                    "other_lines": [x for x in (job.get("other_lines") or []) if x and not is_noise_value(x)],
+                    "other_lines": [x for x in (job.get("other_lines") or []) if x and not is_noise_value(_other_value_part(x))],
                     "aws_pairs": job.get("aws_pairs") or [],
                     "raw_lines": [],
                     "sendgrid": [],
@@ -369,6 +373,7 @@ def aggregate_results(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         for line in p_lines:
             if line not in priority:
                 priority.append(line)
+        # Jobs are expected newest-first; append so Other APIs stay newest→oldest.
         for line in o_lines:
             if line not in other and line not in priority:
                 other.append(line)

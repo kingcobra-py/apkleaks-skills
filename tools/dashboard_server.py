@@ -355,8 +355,15 @@ def start_scan(threads: int | None = None) -> dict:
 
 
 def _iter_result_jobs(status_jobs: list | None = None) -> list[dict]:
-    """Merge status jobs with on-disk per-APK JSON (prefer full findings)."""
-    jobs: list[dict] = list(status_jobs or [])
+    """Merge status jobs with on-disk per-APK JSON (prefer full findings).
+
+    Returns jobs newest-first so Other APIs list newest discoveries first.
+    """
+    jobs: list[tuple[float, dict]] = []
+    for idx, job in enumerate(status_jobs or []):
+        if isinstance(job, dict) and job.get("apk"):
+            # Status jobs are appended oldest→newest; use index as fallback time.
+            jobs.append((float(idx), dict(job)))
     if RESULTS_DIR.is_dir():
         for path in RESULTS_DIR.glob("*.json"):
             if path.name in {
@@ -371,25 +378,35 @@ def _iter_result_jobs(status_jobs: list | None = None) -> list[dict]:
             except json.JSONDecodeError:
                 continue
             if isinstance(job, dict) and job.get("apk"):
-                jobs.append(job)
-    by_name: dict[str, dict] = {}
-    for job in jobs:
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                job = dict(job)
+                job["_mtime"] = mtime
+                jobs.append((mtime, job))
+    by_name: dict[str, tuple[float, dict]] = {}
+    for mtime, job in jobs:
         name = job.get("apk") or ""
         if not name:
             continue
         prev = by_name.get(name)
         if prev is None:
-            by_name[name] = job
+            by_name[name] = (mtime, job)
             continue
-        prev_has = bool(prev.get("findings") or prev.get("results"))
+        prev_mtime, prev_job = prev
+        prev_has = bool(prev_job.get("findings") or prev_job.get("results"))
         cur_has = bool(job.get("findings") or job.get("results"))
-        prev_pri = len(prev.get("priority_lines") or []) + len(prev.get("other_lines") or [])
+        prev_pri = len(prev_job.get("priority_lines") or []) + len(prev_job.get("other_lines") or [])
         cur_pri = len(job.get("priority_lines") or []) + len(job.get("other_lines") or [])
         if cur_has and not prev_has:
-            by_name[name] = job
+            by_name[name] = (mtime, job)
         elif cur_has == prev_has and cur_pri > prev_pri:
-            by_name[name] = job
-    return list(by_name.values())
+            by_name[name] = (mtime, job)
+        elif cur_has == prev_has and cur_pri == prev_pri and mtime >= prev_mtime:
+            by_name[name] = (mtime, job)
+    ordered = sorted(by_name.values(), key=lambda item: item[0], reverse=True)
+    return [job for _, job in ordered]
 
 
 def load_status(status_path: Path) -> dict:
