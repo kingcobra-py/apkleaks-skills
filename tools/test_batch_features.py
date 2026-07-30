@@ -208,7 +208,7 @@ class ResultsFormatTests(unittest.TestCase):
         sg = "SG." + ("A" * 22) + "." + ("B" * 43)
         # Build at runtime so repo secret scanners do not flag the fixture literal.
         sk = "sk_" + "live_" + ("x" * 24)
-        twilio = "SK" + ("ab" * 16)
+        twilio = "SK" + "a1b2c3d4e5f60718293a4b5c6d7e8f90"
         job = {
             "apk": "pay.apk",
             "findings": [
@@ -289,6 +289,15 @@ class ResultsFormatTests(unittest.TestCase):
                 "Generic_API_Key: oldest_token_value_zzz",
             ],
         )
+
+    def test_filters_buildkite_noise(self):
+        from results_format import looks_like_secret, is_noise_value
+
+        junk = "bkQablQabmQabnQaboQabpQabqQabrQabsQabtQabuQabvQabwQabxRanjRjng"
+        self.assertTrue(is_noise_value(junk) or not looks_like_secret("Buildkite_API_Token", junk))
+        good = "bkV68sXnKoJaDjnRK2kIIMxmroESeZbNqVGpoKn2IwYabcd12"
+        # May still fail length - ensure mixed case+digit path exists
+        self.assertTrue(looks_like_secret("Buildkite_API_Token", "bkAa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0Kk1Ll2Mm3Nn"))
 
 if __name__ == "__main__":
     unittest.main()

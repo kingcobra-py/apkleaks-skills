@@ -8,6 +8,7 @@ Other box: any other credential-like API/token values.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any
 
 AWS_KEY_NAMES = {
@@ -129,6 +130,54 @@ def is_noise_value(value: str) -> bool:
     if v.count(".") >= 2 and not _JWT_RE.match(v):
         if "Gradle" in v or "version" in v.lower():
             return True
+    # Structured high-signal formats — skip entropy heuristics.
+    if _SENDGRID_RE.fullmatch(v) or _SK_LIVE_RE.fullmatch(v) or _RK_LIVE_RE.fullmatch(v):
+        return False
+    if _AKIA_RE.search(v):
+        return False
+    if _is_low_entropy_token(v):
+        return True
+    return False
+
+
+def _is_low_entropy_token(value: str) -> bool:
+    """Reject repetitive / keyboard-mash tokens that loose regexes love."""
+    v = value.strip().strip("'\"")
+    # Strip common prefixes for entropy check
+    body = v
+    for prefix in ("bk", "oy2", "SG.", "AC", "SK", "AKIA"):
+        if body.startswith(prefix):
+            body = body[len(prefix) :]
+            break
+    if len(body) < 12:
+        return False
+    # Too many identical characters
+    counts = Counter(body.lower())
+    most = counts.most_common(1)[0][1]
+    if most / max(1, len(body)) >= 0.35:
+        return True
+    # Mostly sequential runs (abcde / 12345) or alternating pairs
+    asc = sum(1 for i in range(len(body) - 1) if ord(body[i + 1]) - ord(body[i]) == 1)
+    if asc / max(1, len(body) - 1) >= 0.45:
+        return True
+    # Very few unique chars overall
+    if len(counts) <= max(4, len(body) // 10):
+        return True
+    # Obvious source/identifier noise
+    noise_bits = (
+        "file_text",
+        "sort_by",
+        "alphabet",
+        "attribute",
+        "bls12_",
+        "eip-",
+        "jwk_",
+        "Qab",
+        "lsbls",
+    )
+    low = v.lower()
+    if any(b.lower() in low for b in noise_bits):
+        return True
     return False
 
 
@@ -138,6 +187,29 @@ def looks_like_secret(name: str, value: str) -> bool:
         return False
     if is_noise_value(value):
         return False
+    if name == "Buildkite_API_Token":
+        # Real tokens aren't pure lowercase runs / repeated Qab fragments.
+        body = value[2:] if value.startswith("bk") else value
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,60}", body):
+            return False
+        if body.islower() or body.isupper():
+            return False
+        if not re.search(r"[0-9]", body):
+            return False
+        if not re.search(r"[A-Z]", body) or not re.search(r"[a-z]", body):
+            return False
+    if name == "Twilio_Account_SID":
+        if not re.fullmatch(r"AC[a-fA-F0-9]{32}", value):
+            return False
+        # Reject all-same-nibble junk like AC0000...
+        hexpart = value[2:]
+        if len(set(hexpart.lower())) < 6:
+            return False
+    if name == "NuGet_API_Key":
+        if not re.fullmatch(r"oy2[a-zA-Z0-9_-]{43}", value):
+            return False
+        if value[3:].islower() and not re.search(r"[0-9]", value):
+            return False
     if name == "JSON_Web_Token":
         return bool(_JWT_RE.match(value)) and value.startswith("eyJ")
     if name == "Authorization_Bearer":
@@ -330,9 +402,20 @@ def aggregate_results(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             # If both priority/other already present, prefer them
             if job.get("priority_lines") is not None or job.get("other_lines") is not None:
+                cleaned_other = []
+                for x in job.get("other_lines") or []:
+                    if not x:
+                        continue
+                    raw = _other_value_part(x)
+                    name = x.split(": ", 1)[0] if ": " in x else ""
+                    if is_noise_value(raw):
+                        continue
+                    if name and not looks_like_secret(name, raw):
+                        continue
+                    cleaned_other.append(x)
                 norm = {
                     "priority_lines": [x for x in (job.get("priority_lines") or []) if x],
-                    "other_lines": [x for x in (job.get("other_lines") or []) if x and not is_noise_value(_other_value_part(x))],
+                    "other_lines": cleaned_other,
                     "aws_pairs": job.get("aws_pairs") or [],
                     "raw_lines": [],
                     "sendgrid": [],

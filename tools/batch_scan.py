@@ -62,6 +62,71 @@ _LINKFINDER_SKIP = re.compile(
     r"^.(L[a-z]|application|audio|fonts|image|kotlin|layout|multipart|plain|text|video).*\/.+"
 )
 
+# Only scan text-ish decompiled sources — skipping binaries/resources is a large speedup.
+_SCAN_EXTENSIONS = {
+    ".java",
+    ".kt",
+    ".kts",
+    ".xml",
+    ".smali",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".json",
+    ".properties",
+    ".txt",
+    ".yml",
+    ".yaml",
+    ".gradle",
+    ".html",
+    ".htm",
+    ".css",
+    ".proto",
+    ".plist",
+    ".cfg",
+    ".ini",
+    ".env",
+    ".sql",
+    ".md",
+}
+_SKIP_DIR_PARTS = (
+    "/androidx/",
+    "/kotlin/",
+    "/kotlinx/",
+    "/okhttp3/",
+    "/okio/",
+    "/retrofit2/",
+    "/com/google/android/",
+    "/com/google/gson/",
+    "/com/google/protobuf/",
+    "/org/apache/",
+    "/org/intellij/",
+    "/org/jetbrains/",
+    "/META-INF/",
+    "/res/drawable",
+    "/res/mipmap",
+    "/res/raw/",
+    "/assets/fonts/",
+)
+_MAX_SCAN_FILE_BYTES = 1_500_000
+
+# Patterns that are expensive and low-value for batch high-severity secret hunting.
+_SKIP_PATTERN_NAMES = {
+    "LinkFinder",
+    "IP_Address",
+    "IPv4",
+    "IPv6",
+    "Mac_Address",
+    "Mailto",
+    "Email",
+    "URL",
+    "DEFCON_CTF_Flag",
+    "HackerOne_CTF_Flag",
+    "HackTheBox_CTF_Flag",
+    "TryHackMe_CTF_Flag",
+}
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -170,12 +235,34 @@ def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compile_pattern_rules(pattern_path: str | Path) -> list[tuple[str, re.Pattern[str]]]:
+def _compile_pattern_rules(
+    pattern_path: str | Path,
+    severity: str | None = None,
+) -> list[tuple[str, re.Pattern[str]]]:
     """Load regex JSON into (name, compiled) pairs. List values expand to multiple rules."""
     with open(pattern_path, encoding="utf-8") as handle:
         regex = json.load(handle)
+
+    sev_rank: int | None = None
+    severity_map: dict[str, str] = {}
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    if severity:
+        try:
+            cli = _load_cli()
+            severity_map = getattr(cli, "SEVERITY_MAP", {}) or {}
+            severity_order = getattr(cli, "SEVERITY_ORDER", severity_order) or severity_order
+            sev_rank = severity_order.get(severity)
+        except Exception:  # noqa: BLE001
+            sev_rank = severity_order.get(severity)
+
     compiled: list[tuple[str, re.Pattern[str]]] = []
     for name, pattern in regex.items():
+        if name in _SKIP_PATTERN_NAMES:
+            continue
+        if sev_rank is not None:
+            cat_sev = severity_map.get(name, "medium")
+            if severity_order.get(cat_sev, 3) > sev_rank:
+                continue
         patterns = pattern if isinstance(pattern, list) else [pattern]
         for p in patterns:
             if not isinstance(p, str) or not p:
@@ -185,6 +272,18 @@ def _compile_pattern_rules(pattern_path: str | Path) -> list[tuple[str, re.Patte
             except re.error:
                 LOG.warning("Skipping invalid regex for %s", name)
     return compiled
+
+
+def _should_scan_file(path: str) -> bool:
+    lower = path.replace("\\", "/")
+    for part in _SKIP_DIR_PARTS:
+        if part in lower:
+            return False
+    ext = os.path.splitext(lower)[1]
+    if ext in _SCAN_EXTENSIONS:
+        return True
+    # Small extensionless text files (rare) — skip by default.
+    return False
 
 
 def _filter_linkfinder_secret(secret: str) -> str | None:
@@ -206,17 +305,34 @@ def fast_scan_tempdir(
     tempdir: str | Path,
     pattern_path: str | Path,
     on_progress: Callable[[int, int], None] | None = None,
+    severity: str | None = None,
 ) -> list[dict[str, Any]]:
     """Single-pass secret scan: walk each file once, apply all patterns.
 
     Upstream APKLeaks.scanning() walks the whole tree once per regex (~95 full
     passes), which looks frozen at a fixed UI percent for many minutes.
     """
-    rules = _compile_pattern_rules(pattern_path)
+    rules = _compile_pattern_rules(pattern_path, severity=severity)
     files: list[str] = []
-    for fp, _, fnames in os.walk(tempdir):
+    for fp, dirnames, fnames in os.walk(tempdir):
+        # Prune heavy vendor trees in-place.
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d
+            not in {
+                "androidx",
+                "kotlin",
+                "kotlinx",
+                "okhttp3",
+                "okio",
+                "META-INF",
+            }
+        ]
         for fn in fnames:
-            files.append(os.path.join(fp, fn))
+            filepath = os.path.join(fp, fn)
+            if _should_scan_file(filepath):
+                files.append(filepath)
 
     found: dict[str, set[str]] = {}
     total = len(files)
@@ -228,18 +344,21 @@ def fast_scan_tempdir(
 
     for idx, filepath in enumerate(files, 1):
         try:
-            with open(filepath, encoding="utf-8", errors="ignore") as handle:
-                for line in handle:
+            size = os.path.getsize(filepath)
+            if size <= 0 or size > _MAX_SCAN_FILE_BYTES:
+                pass
+            else:
+                with open(filepath, encoding="utf-8", errors="ignore") as handle:
+                    data = handle.read()
+                if data:
                     for name, matcher in rules:
-                        mo = matcher.search(line)
-                        if not mo:
-                            continue
-                        secret = mo.group()
-                        if name == "LinkFinder":
-                            secret = _filter_linkfinder_secret(secret)
-                            if secret is None:
-                                continue
-                        found.setdefault(name, set()).add(secret)
+                        for mo in matcher.finditer(data):
+                            secret = mo.group()
+                            if name == "LinkFinder":
+                                secret = _filter_linkfinder_secret(secret)
+                                if secret is None:
+                                    continue
+                            found.setdefault(name, set()).add(secret)
         except OSError:
             pass
 
@@ -257,6 +376,7 @@ def fast_scan_tempdir(
 def _fast_scanning(
     runner: Any,
     on_progress: Callable[[int, int], None] | None = None,
+    severity: str | None = None,
 ) -> None:
     """Replace runner.scanning() with single-pass walk + live progress."""
     package = ""
@@ -265,7 +385,12 @@ def _fast_scanning(
         package = getattr(apk_obj, "package", "") or ""
     runner.out_json["package"] = package
     runner.out_json["results"] = []
-    results = fast_scan_tempdir(runner.tempdir, runner.pattern, on_progress=on_progress)
+    results = fast_scan_tempdir(
+        runner.tempdir,
+        runner.pattern,
+        on_progress=on_progress,
+        severity=severity,
+    )
     runner.out_json["results"] = results
     if results:
         runner.scanned = True
@@ -361,7 +486,7 @@ def _scan_one(
         phase("scanning", "Matching secret patterns (single pass)", SCAN_PCT_START)
         # Single-pass walk — upstream scanning() re-walks the tree per regex and
         # freezes the UI at a fixed percent for a very long time.
-        _fast_scanning(runner, on_progress=on_scan_progress)
+        _fast_scanning(runner, on_progress=on_scan_progress, severity=severity)
 
         phase("classifying", "Classifying findings", PHASE_PERCENT["classifying"])
         raw_results = runner.out_json.copy()
@@ -485,7 +610,25 @@ def run_batch(
     apks = discover_apks(input_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     status_file = status_path or (output_dir / "status.json")
+
+    # Resume: skip APKs that already have a successful result JSON.
+    pending: list[Path] = []
+    skipped_done = 0
+    for apk in apks:
+        result_path = output_dir / f"{apk.stem}.json"
+        if result_path.is_file():
+            try:
+                prev = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(prev, dict) and prev.get("ok") is True:
+                    skipped_done += 1
+                    continue
+            except json.JSONDecodeError:
+                pass
+        pending.append(apk)
+    apks = pending
+
     status = _empty_status(len(apks), threads, str(input_dir), str(output_dir))
+    status["progress"]["skipped_done"] = skipped_done
     # Keep previously found secrets visible while a new scan starts.
     try:
         seed_jobs: list[tuple[float, dict[str, Any]]] = []
@@ -514,9 +657,12 @@ def run_batch(
             status["counts"]["has_aws"] = len(status["aws_pairs"])
     except Exception:  # noqa: BLE001
         pass
-    # Pre-populate queue snapshot so UI can show pending apps
     status["queue_preview"] = [p.name for p in apks[:50]]
-    _append_log(status, "info", f"Discovered {len(apks)} APK(s); threads={threads}")
+    _append_log(
+        status,
+        "info",
+        f"Discovered work: {len(apks)} pending, {skipped_done} already scanned; threads={threads}",
+    )
     _write_status(status_file, status)
 
     if not apks:

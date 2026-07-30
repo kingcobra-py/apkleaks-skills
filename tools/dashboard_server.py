@@ -30,6 +30,7 @@ _STATE_LOCK = threading.Lock()
 _DOWNLOAD_PROC: subprocess.Popen | None = None
 _SCAN_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
+_RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
 
 
 DEMO_STATUS = {
@@ -169,6 +170,15 @@ def system_stats() -> dict:
     with _STATE_LOCK:
         download_running = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
         scan_running = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
+    if not scan_running:
+        try:
+            out = subprocess.check_output(
+                ["pgrep", "-f", "tools/batch_scan.py"],
+                text=True,
+            ).strip()
+            scan_running = bool(out)
+        except Exception:  # noqa: BLE001
+            scan_running = False
 
     return {
         "ok": True,
@@ -332,6 +342,8 @@ def start_scan(threads: int | None = None) -> dict:
             str(RESULTS_DIR),
             "-s",
             str(cfg.get("severity") or "high"),
+            "-a",
+            "-j 2",
             "--status",
             str(RESULTS_DIR / "status.json"),
         ]
@@ -409,14 +421,79 @@ def _iter_result_jobs(status_jobs: list | None = None) -> list[dict]:
     return [job for _, job in ordered]
 
 
+def _results_cache_key() -> tuple:
+    """Cheap fingerprint of results dir + status so we can skip full re-aggregates."""
+    status_mtime = 0.0
+    status_path = RESULTS_DIR / "status.json"
+    if status_path.is_file():
+        try:
+            status_mtime = status_path.stat().st_mtime
+        except OSError:
+            status_mtime = 0.0
+    newest = status_mtime
+    count = 0
+    if RESULTS_DIR.is_dir():
+        for path in RESULTS_DIR.glob("*.json"):
+            if path.name in {
+                "status.json",
+                "summary.json",
+                "dashboard-config.json",
+                "download-status.json",
+            }:
+                continue
+            count += 1
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                pass
+    return (count, round(newest, 3), round(status_mtime, 3))
+
+
+def _cached_aggregate(status_jobs: list | None = None, force: bool = False) -> dict:
+    """Aggregate results with a short-lived cache — /api/status was taking 15–25s."""
+    key = _results_cache_key()
+    now = time.time()
+    cached = _RESULTS_CACHE.get("agg")
+    if (
+        not force
+        and cached is not None
+        and _RESULTS_CACHE.get("key") == key
+        and (now - float(_RESULTS_CACHE.get("built_at") or 0)) < 8.0
+    ):
+        return cached
+    jobs = _iter_result_jobs(status_jobs or [])
+    agg = aggregate_results(jobs)
+    _RESULTS_CACHE["key"] = key
+    _RESULTS_CACHE["agg"] = agg
+    _RESULTS_CACHE["built_at"] = now
+    return agg
+
+
 def load_status(status_path: Path) -> dict:
     if status_path.is_file():
         try:
             data = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # Always merge disk per-APK files so Priority/Other do not vanish
-                # when a new scan rewrites status.json with an empty jobs list.
-                agg = aggregate_results(_iter_result_jobs(data.get("jobs") or []))
+                # Detect dead scanners: status says running but process is gone.
+                with _STATE_LOCK:
+                    alive = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
+                if data.get("state") == "running" and not alive:
+                    # Also check OS for an orphaned batch_scan started outside this server.
+                    try:
+                        out = subprocess.check_output(
+                            ["pgrep", "-f", "tools/batch_scan.py"],
+                            text=True,
+                        ).strip()
+                        alive = bool(out)
+                    except Exception:  # noqa: BLE001
+                        alive = False
+                if data.get("state") == "running" and not alive:
+                    data["state"] = "idle"
+                    data["active"] = {}
+                    data["current"] = []
+                    data["scan_dead"] = True
+
+                agg = _cached_aggregate(data.get("jobs") or [])
                 data["raw_lines"] = agg["lines"]
                 data["priority_lines"] = agg.get("priority_lines") or []
                 data["other_lines"] = agg.get("other_lines") or []
@@ -434,8 +511,8 @@ def load_status(status_path: Path) -> dict:
 
 def collect_results(status_path: Path) -> dict:
     status = load_status(status_path)
-    jobs = _iter_result_jobs(status.get("jobs") or [])
-    agg = aggregate_results(jobs)
+    agg = _cached_aggregate(status.get("jobs") or [], force=False)
+    agg = dict(agg)
     agg["total"] = len(agg.get("lines") or [])
     agg["priority_total"] = len(agg.get("priority_lines") or [])
     agg["other_total"] = len(agg.get("other_lines") or [])
