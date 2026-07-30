@@ -51,13 +51,38 @@ DEMO_STATUS = {
         "has_sendgrid": 0,
         "has_stripe": 1,
     },
-    "current": ["org.example.app.apk"],
+    "current": ["org.example.app.apk", "com.demo.wallet.apk"],
+    "active": {
+        "org.example.app.apk": {
+            "apk": "org.example.app.apk",
+            "phase": "decompiling",
+            "percent": 45,
+            "message": "Decompiling with jadx (this can take a while)",
+            "elapsed_ms": 18200,
+            "started_at": "2026-07-29T21:10:00+00:00",
+        },
+        "com.demo.wallet.apk": {
+            "apk": "com.demo.wallet.apk",
+            "phase": "scanning",
+            "percent": 78,
+            "message": "Matching secret patterns",
+            "elapsed_ms": 9400,
+            "started_at": "2026-07-29T21:11:00+00:00",
+        },
+    },
     "jobs": [],
     "logs": [
         {"ts": "2026-07-29T21:00:01+00:00", "level": "info", "message": "Discovered 100 APK(s); threads=4"},
     ],
     "raw_lines": [
         "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "example_payment_token_not_real",
+        "example_mail_token_not_real",
+    ],
+    "priority_lines": [
+        "AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    ],
+    "other_lines": [
         "example_payment_token_not_real",
         "example_mail_token_not_real",
     ],

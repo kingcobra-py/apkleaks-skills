@@ -54,6 +54,14 @@ type SystemStats = {
   scan_running?: boolean;
   config?: { threads?: number; download_count?: number };
 };
+type ActiveApp = {
+  apk: string;
+  phase: string;
+  percent: number;
+  message: string;
+  elapsed_ms?: number;
+  started_at?: string;
+};
 type Status = {
   ok: boolean;
   demo?: boolean;
@@ -74,12 +82,24 @@ type Status = {
     has_stripe: number;
   };
   current: string[];
+  active?: Record<string, ActiveApp>;
   jobs: Job[];
   logs: LogLine[];
   raw_lines?: string[];
   aws_pairs?: string[];
   system?: SystemStats;
   config?: { threads?: number; download_count?: number };
+};
+
+const PHASE_COLOR: Record<string, string> = {
+  queued: '#64748b',
+  starting: '#38bdf8',
+  integrity: '#22d3ee',
+  decompiling: '#818cf8',
+  scanning: '#f59e0b',
+  classifying: '#a78bfa',
+  done: '#10b981',
+  failed: '#ef4444',
 };
 
 const DEMO: Status = {
@@ -94,7 +114,23 @@ const DEMO: Status = {
   finished_at: null,
   progress: { total: 100, completed: 42, succeeded: 40, failed: 2, percent: 42 },
   counts: { findings: 3, critical: 1, high: 2, has_aws: 1, has_sendgrid: 0, has_stripe: 1 },
-  current: ['org.example.app.apk'],
+  current: ['org.example.app.apk', 'com.demo.wallet.apk'],
+  active: {
+    'org.example.app.apk': {
+      apk: 'org.example.app.apk',
+      phase: 'decompiling',
+      percent: 45,
+      message: 'Decompiling with jadx (this can take a while)',
+      elapsed_ms: 18200,
+    },
+    'com.demo.wallet.apk': {
+      apk: 'com.demo.wallet.apk',
+      phase: 'scanning',
+      percent: 78,
+      message: 'Matching secret patterns',
+      elapsed_ms: 9400,
+    },
+  },
   jobs: [],
   logs: [{ ts: '2026-07-29T21:00:01+00:00', level: 'info', message: 'Discovered 100 APK(s); threads=4' }],
   raw_lines: [
@@ -256,6 +292,19 @@ const DashboardPage: React.FC = () => {
   const sys = status.system;
   const cpu = sys?.cpu_percent ?? 0;
   const mem = sys?.memory?.percent ?? 0;
+  const activeApps = useMemo(() => {
+    const map = status.active || {};
+    const list = Object.values(map);
+    if (list.length) return list.sort((a, b) => (b.elapsed_ms || 0) - (a.elapsed_ms || 0));
+    // Fallback for older status.json without active map
+    return (status.current || []).map((apk) => ({
+      apk,
+      phase: 'scanning',
+      percent: 50,
+      message: 'Working…',
+      elapsed_ms: 0,
+    }));
+  }, [status.active, status.current]);
 
   const columns = useMemo(
     () => [
@@ -405,16 +454,64 @@ const DashboardPage: React.FC = () => {
               </Tag>
               <Tag icon={<ApiOutlined />}>other APIs: {otherLines.length}</Tag>
             </Space>
-            {status.current?.length ? (
-              <Paragraph style={{ marginTop: 16, marginBottom: 0 }}>
-                <Text type="secondary">Currently scanning: </Text>
-                {status.current.map((name) => (
-                  <Tag key={name} color="processing">
-                    {name}
-                  </Tag>
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <SyncOutlined spin={activeApps.length > 0 && status.state === 'running'} />
+                Apps in progress
+                <Tag color="processing">{activeApps.length}</Tag>
+              </Space>
+            }
+          >
+            {activeApps.length ? (
+              <Row gutter={[12, 12]}>
+                {activeApps.map((app) => (
+                  <Col xs={24} md={12} xl={8} key={app.apk}>
+                    <div
+                      style={{
+                        border: '1px solid #1e293b',
+                        borderRadius: 10,
+                        padding: 12,
+                        background: 'rgba(15, 23, 42, 0.55)',
+                      }}
+                    >
+                      <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                        <Text code style={{ fontSize: 12 }}>
+                          {app.apk}
+                        </Text>
+                        <Tag color={PHASE_COLOR[app.phase] || 'default'}>{app.phase}</Tag>
+                      </Space>
+                      <Progress
+                        percent={Math.min(100, Number(app.percent) || 0)}
+                        size="small"
+                        status={app.phase === 'failed' ? 'exception' : 'active'}
+                        strokeColor={PHASE_COLOR[app.phase] || '#818cf8'}
+                        style={{ marginTop: 8, marginBottom: 4 }}
+                      />
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {app.message}
+                        </Text>
+                        <Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                          {((app.elapsed_ms || 0) / 1000).toFixed(1)}s
+                        </Text>
+                      </div>
+                    </div>
+                  </Col>
                 ))}
-              </Paragraph>
-            ) : null}
+              </Row>
+            ) : (
+              <Text type="secondary">
+                {status.state === 'running' ? 'Waiting for the next APK worker…' : 'No apps scanning right now.'}
+              </Text>
+            )}
           </Card>
         </Col>
       </Row>
