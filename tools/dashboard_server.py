@@ -27,11 +27,12 @@ CONFIG_PATH = RESULTS_DIR / "dashboard-config.json"
 DOWNLOAD_STATUS_PATH = RESULTS_DIR / "download-status.json"
 LOOP_STATUS_PATH = RESULTS_DIR / "loop-status.json"
 
-_STATE_LOCK = threading.Lock()
+_STATE_LOCK = threading.RLock()
 _DOWNLOAD_PROC: subprocess.Popen | None = None
 _SCAN_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
 _RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
+_SYSTEM_CACHE: dict = {"built_at": 0.0, "data": None}
 _LOOP_STOP = threading.Event()
 _LOOP_THREAD: threading.Thread | None = None
 _META_SKIP = {
@@ -166,8 +167,17 @@ def _read_cpu_times() -> tuple[int, int]:
     return idle, total
 
 
-def system_stats() -> dict:
+def system_stats(force: bool = False) -> dict:
     global _PREV_CPU
+    now = time.time()
+    cached = _SYSTEM_CACHE.get("data")
+    if (
+        not force
+        and cached is not None
+        and (now - float(_SYSTEM_CACHE.get("built_at") or 0)) < 1.5
+    ):
+        return cached
+
     meminfo = {}
     for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
         if ":" not in line:
@@ -205,12 +215,13 @@ def system_stats() -> dict:
             out = subprocess.check_output(
                 ["pgrep", "-f", "tools/batch_scan.py"],
                 text=True,
+                timeout=2,
             ).strip()
             scan_running = bool(out)
         except Exception:  # noqa: BLE001
             scan_running = False
 
-    return {
+    data = {
         "ok": True,
         "cpu_percent": cpu_percent,
         "memory": {
@@ -229,6 +240,9 @@ def system_stats() -> dict:
         "loop": load_loop_status(),
         "config": load_config(),
     }
+    _SYSTEM_CACHE["data"] = data
+    _SYSTEM_CACHE["built_at"] = now
+    return data
 
 
 def _write_download_status(payload: dict) -> None:
@@ -575,32 +589,43 @@ def start_loop(
         patch["download_workers"] = download_workers
     cfg = save_config(patch)
 
-    with _STATE_LOCK:
-        if _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set():
-            return {
-                "ok": True,
-                "state": "already_running",
-                "config": cfg,
-                "loop": load_loop_status(),
-                "message": "Loop already running — settings updated for next cycle",
-            }
-        _LOOP_STOP.clear()
-        _write_loop_status({
-            "ok": True,
-            "enabled": True,
-            "running": True,
-            "state": "starting",
-            "phase": "starting",
-            "cycle": int(load_loop_status().get("cycle") or 0),
-            "apps": cfg["loop_apps"],
-            "threads": cfg["loop_threads"],
-            "download_workers": cfg["loop_download_workers"],
-            "message": "Starting auto loop",
-            "updated_at": _utc_now(),
-        })
-        _LOOP_THREAD = threading.Thread(target=_loop_worker, name="auto-loop", daemon=True)
-        _LOOP_THREAD.start()
+    # Read cycle outside the lock — never call load_loop_status while holding
+    # _STATE_LOCK with a non-reentrant lock (that deadlocked the whole API).
+    prev_cycle = int(load_loop_status().get("cycle") or 0)
 
+    with _STATE_LOCK:
+        already = _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set()
+        if already:
+            started = False
+        else:
+            _LOOP_STOP.clear()
+            _LOOP_THREAD = threading.Thread(target=_loop_worker, name="auto-loop", daemon=True)
+            _LOOP_THREAD.start()
+            started = True
+
+    if not started:
+        return {
+            "ok": True,
+            "state": "already_running",
+            "config": cfg,
+            "loop": load_loop_status(),
+            "message": "Loop already running — settings updated for next cycle",
+        }
+
+    _write_loop_status({
+        "ok": True,
+        "enabled": True,
+        "running": True,
+        "state": "starting",
+        "phase": "starting",
+        "cycle": prev_cycle,
+        "apps": cfg["loop_apps"],
+        "threads": cfg["loop_threads"],
+        "download_workers": cfg["loop_download_workers"],
+        "message": "Starting auto loop",
+        "updated_at": _utc_now(),
+    })
+    _SYSTEM_CACHE["built_at"] = 0.0
     return {
         "ok": True,
         "state": "started",
@@ -639,88 +664,97 @@ def stop_loop() -> dict:
 
 def clear_downloaded_apks() -> dict:
     """Delete all .apk files from the APKs directory (keeps scan results)."""
-    global _DOWNLOAD_PROC
     with _STATE_LOCK:
-        if _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None:
-            return {"ok": False, "error": "Download is running — stop it first", "error_code": "BUSY"}
-        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
-            return {"ok": False, "error": "Scan is running — stop it before deleting APKs", "error_code": "BUSY"}
+        download_busy = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
+        scan_busy = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
+    if download_busy:
+        return {"ok": False, "error": "Download is running — stop it first", "error_code": "BUSY"}
+    if scan_busy:
+        return {"ok": False, "error": "Scan is running — stop it before deleting APKs", "error_code": "BUSY"}
 
-        APKS_DIR.mkdir(parents=True, exist_ok=True)
-        removed = 0
-        failed = 0
-        errors: list[str] = []
-        for path in sorted(APKS_DIR.glob("*.apk")):
-            if not path.is_file():
-                continue
-            try:
-                path.unlink()
-                removed += 1
-            except OSError as exc:
-                failed += 1
-                if len(errors) < 5:
-                    errors.append(f"{path.name}: {exc}")
-        # Also drop partial downloads
-        for path in APKS_DIR.glob("*.apk.part"):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        remaining = len(list(APKS_DIR.glob("*.apk")))
-        return {
-            "ok": failed == 0,
-            "removed": removed,
-            "failed": failed,
-            "remaining": remaining,
-            "errors": errors,
-            "message": f"Removed {removed} downloaded APK(s)" + (f"; {failed} failed" if failed else ""),
-        }
+    APKS_DIR.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    failed = 0
+    errors: list[str] = []
+    for path in sorted(APKS_DIR.glob("*.apk")):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            failed += 1
+            if len(errors) < 5:
+                errors.append(f"{path.name}: {exc}")
+    # Also drop partial downloads
+    for path in APKS_DIR.glob("*.apk.part"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    remaining = len(list(APKS_DIR.glob("*.apk")))
+    _SYSTEM_CACHE["built_at"] = 0.0
+    return {
+        "ok": failed == 0,
+        "removed": removed,
+        "failed": failed,
+        "remaining": remaining,
+        "errors": errors,
+        "message": f"Removed {removed} downloaded APK(s)" + (f"; {failed} failed" if failed else ""),
+    }
 
 
 def start_scan(threads: int | None = None) -> dict:
     global _SCAN_PROC
     cfg = save_config({"threads": threads} if threads is not None else {})
     threads_n = int(cfg["threads"])
+    old_proc: subprocess.Popen | None = None
     with _STATE_LOCK:
         if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
-            try:
-                os.killpg(os.getpgid(_SCAN_PROC.pid), 15)
-            except OSError:
-                try:
-                    _SCAN_PROC.terminate()
-                except OSError:
-                    pass
-            try:
-                _SCAN_PROC.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                try:
-                    _SCAN_PROC.kill()
-                except OSError:
-                    pass
+            old_proc = _SCAN_PROC
+            _SCAN_PROC = None
 
-        APKS_DIR.mkdir(parents=True, exist_ok=True)
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = ROOT / "logs" / "batch_scan.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        venv_python = ROOT / ".venv" / "bin" / "python3"
-        python = str(venv_python) if venv_python.is_file() else sys.executable
-        cmd = [
-            python,
-            str(TOOLS / "batch_scan.py"),
-            "-d",
-            str(APKS_DIR),
-            "-t",
-            str(threads_n),
-            "-o",
-            str(RESULTS_DIR),
-            "-s",
-            str(cfg.get("severity") or "high"),
-            "-a",
-            "-j 2",
-            "--status",
-            str(RESULTS_DIR / "status.json"),
-        ]
-        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    # Kill/wait outside the lock so /api/status never blocks on scan restart.
+    if old_proc is not None:
+        try:
+            os.killpg(os.getpgid(old_proc.pid), 15)
+        except OSError:
+            try:
+                old_proc.terminate()
+            except OSError:
+                pass
+        try:
+            old_proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                old_proc.kill()
+            except OSError:
+                pass
+
+    APKS_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = ROOT / "logs" / "batch_scan.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    venv_python = ROOT / ".venv" / "bin" / "python3"
+    python = str(venv_python) if venv_python.is_file() else sys.executable
+    cmd = [
+        python,
+        str(TOOLS / "batch_scan.py"),
+        "-d",
+        str(APKS_DIR),
+        "-t",
+        str(threads_n),
+        "-o",
+        str(RESULTS_DIR),
+        "-s",
+        str(cfg.get("severity") or "high"),
+        "-a",
+        "-j 2",
+        "--status",
+        str(RESULTS_DIR / "status.json"),
+    ]
+    log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    with _STATE_LOCK:
         _SCAN_PROC = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -729,6 +763,7 @@ def start_scan(threads: int | None = None) -> dict:
             start_new_session=True,
         )
         proc = _SCAN_PROC
+    _SYSTEM_CACHE["built_at"] = 0.0
     return {
         "ok": True,
         "state": "started",
@@ -852,6 +887,7 @@ def load_status(status_path: Path) -> dict:
                         out = subprocess.check_output(
                             ["pgrep", "-f", "tools/batch_scan.py"],
                             text=True,
+                            timeout=2,
                         ).strip()
                         alive = bool(out)
                     except Exception:  # noqa: BLE001
@@ -877,7 +913,7 @@ def load_status(status_path: Path) -> dict:
     return demo
 
 
-def collect_results(status_path: Path) -> dict:
+def collect_results(status_path: Path, persist: bool = True) -> dict:
     status = load_status(status_path)
     agg = _cached_aggregate(status.get("jobs") or [], force=False)
     agg = dict(agg)
@@ -891,7 +927,9 @@ def collect_results(status_path: Path) -> dict:
     agg["other_text"] = "\n".join(agg.get("other_lines") or []) + (
         "\n" if agg.get("other_lines") else ""
     )
-    # Refresh status-facing lines from the authoritative merge.
+    if not persist:
+        return agg
+    # Refresh status-facing lines from the authoritative merge (best-effort).
     try:
         if status_path.is_file():
             data = json.loads(status_path.read_text(encoding="utf-8"))
@@ -992,9 +1030,10 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/status", "/api/status.json"):
             data = load_status(self.status_path)
-            data["system"] = system_stats()
-            data["config"] = load_config()
-            data["loop"] = load_loop_status()
+            sys = system_stats()
+            data["system"] = sys
+            data["config"] = sys.get("config") or load_config()
+            data["loop"] = sys.get("loop") or load_loop_status()
             self._json(data)
             return
 
@@ -1015,7 +1054,8 @@ class StatusHandler(BaseHTTPRequestHandler):
             return
 
         if path in ("/api/results", "/api/results.json"):
-            self._json(collect_results(self.status_path))
+            # Avoid rewriting status.json on every poll — cache handles speed.
+            self._json(collect_results(self.status_path, persist=False))
             return
 
         if path in ("/api/results.txt", "/api/export.txt"):

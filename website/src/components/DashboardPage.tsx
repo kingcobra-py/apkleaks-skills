@@ -193,15 +193,23 @@ const monoBoxStyle: React.CSSProperties = {
   wordBreak: 'break-all',
 };
 
-const apiBaseCandidates = ['', 'http://127.0.0.1:8787'];
+const apiBaseCandidates = [''];
 
-async function apiFetch(path: string, init?: RequestInit): Promise<Response | null> {
+async function apiFetch(path: string, init?: RequestInit, timeoutMs = 4000): Promise<Response | null> {
   for (const base of apiBaseCandidates) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(`${base}${path}`, { cache: 'no-store', ...init });
+      const res = await fetch(`${base}${path}`, {
+        cache: 'no-store',
+        ...init,
+        signal: controller.signal,
+      });
       if (res.ok || res.status < 500) return res;
     } catch {
-      // try next
+      // try next / timeout
+    } finally {
+      window.clearTimeout(timer);
     }
   }
   return null;
@@ -239,8 +247,9 @@ const DashboardPage: React.FC = () => {
     setLoopDownloadWorkers(DEMO.system?.config?.download_workers ?? 10);
   }, []);
 
-  const refresh = useCallback(async () => {
-    const res = await apiFetch('/api/status');
+  const refresh = useCallback(async (opts?: { results?: boolean }) => {
+    const wantResults = opts?.results !== false;
+    const res = await apiFetch('/api/status', undefined, 3500);
     if (!res || !res.ok) {
       // Never flash demo secrets over a live session if the API blips.
       if (!sawLiveRef.current) applyDemo();
@@ -253,37 +262,44 @@ const DashboardPage: React.FC = () => {
     setStatus(data);
     setSource(isDemo ? 'demo' : 'live');
     const cfg = data.config || data.system?.config;
-    if (cfg?.download_count) setDownloadCount(cfg.download_count);
-    if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
-    if (cfg?.threads) setThreads(cfg.threads);
-    else if (data.threads) setThreads(data.threads);
-    if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
-    if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
-    if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
-    else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
+    // Only sync form defaults when controls are idle (avoid fighting the user).
+    if (!busyDownload && !busyLoop && !busyThreads) {
+      if (cfg?.download_count) setDownloadCount(cfg.download_count);
+      if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
+      if (cfg?.threads) setThreads(cfg.threads);
+      else if (data.threads) setThreads(data.threads);
+      if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
+      if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
+      if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
+      else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
+    }
 
-    // Prefer dedicated results endpoint; fall back to status payload so Priority
-    // / Other never briefly clear when /api/results is slow.
+    // Prefer lines already on status (fast). Only hit /api/results occasionally.
     let nextPriority = Array.isArray(data.priority_lines) ? data.priority_lines : null;
     let nextOther = Array.isArray(data.other_lines) ? data.other_lines : null;
-    const resultsRes = await apiFetch('/api/results');
-    if (resultsRes?.ok) {
-      const agg = await resultsRes.json();
-      if (Array.isArray(agg?.priority_lines)) nextPriority = agg.priority_lines;
-      if (Array.isArray(agg?.other_lines)) nextOther = agg.other_lines;
+    if (wantResults) {
+      const resultsRes = await apiFetch('/api/results', undefined, 6000);
+      if (resultsRes?.ok) {
+        const agg = await resultsRes.json();
+        if (Array.isArray(agg?.priority_lines)) nextPriority = agg.priority_lines;
+        if (Array.isArray(agg?.other_lines)) nextOther = agg.other_lines;
+      }
     }
     if (nextPriority !== null) setPriorityLines(nextPriority);
     if (nextOther !== null) setOtherLines(nextOther);
-  }, [applyDemo]);
+  }, [applyDemo, busyDownload, busyLoop, busyThreads]);
 
   useEffect(() => {
     let cancelled = false;
+    let tickN = 0;
     const tick = async () => {
       if (cancelled) return;
-      await refresh();
+      tickN += 1;
+      // Full results merge every ~10s; status every 2s.
+      await refresh({ results: tickN === 1 || tickN % 5 === 0 });
     };
     tick();
-    const id = window.setInterval(tick, 2500);
+    const id = window.setInterval(tick, 2000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
