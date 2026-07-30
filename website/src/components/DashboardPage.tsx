@@ -126,8 +126,8 @@ const DEMO: Status = {
     'com.demo.wallet.apk': {
       apk: 'com.demo.wallet.apk',
       phase: 'scanning',
-      percent: 78,
-      message: 'Matching secret patterns',
+      percent: 72,
+      message: 'Scanning files 3600/5000',
       elapsed_ms: 9400,
     },
   },

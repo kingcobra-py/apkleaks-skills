@@ -9,6 +9,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -46,11 +47,20 @@ PHASE_PERCENT = {
     "starting": 8,
     "integrity": 18,
     "decompiling": 45,
-    "scanning": 78,
+    "scanning": 50,  # floor; live file progress maps 50→90
     "classifying": 92,
     "done": 100,
     "failed": 100,
 }
+
+# Scanning sub-progress range (percent) while matching patterns.
+SCAN_PCT_START = 50
+SCAN_PCT_END = 90
+
+# Skip LinkFinder MIME-ish false positives (mirrors apkleaks.APKLeaks.extract).
+_LINKFINDER_SKIP = re.compile(
+    r"^.(L[a-z]|application|audio|fonts|image|kotlin|layout|multipart|plain|text|video).*\/.+"
+)
 
 
 def _utc_now() -> str:
@@ -160,19 +170,120 @@ def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compile_pattern_rules(pattern_path: str | Path) -> list[tuple[str, re.Pattern[str]]]:
+    """Load regex JSON into (name, compiled) pairs. List values expand to multiple rules."""
+    with open(pattern_path, encoding="utf-8") as handle:
+        regex = json.load(handle)
+    compiled: list[tuple[str, re.Pattern[str]]] = []
+    for name, pattern in regex.items():
+        patterns = pattern if isinstance(pattern, list) else [pattern]
+        for p in patterns:
+            if not isinstance(p, str) or not p:
+                continue
+            try:
+                compiled.append((name, re.compile(p)))
+            except re.error:
+                LOG.warning("Skipping invalid regex for %s", name)
+    return compiled
+
+
+def _filter_linkfinder_secret(secret: str) -> str | None:
+    if _LINKFINDER_SKIP.match(secret) is not None:
+        return None
+    if len(secret) >= 2 and secret.startswith("'") and secret.endswith("'"):
+        return secret[1:-1]
+    return secret
+
+
+def _scan_percent(done: int, total: int) -> int:
+    if total <= 0:
+        return SCAN_PCT_END
+    ratio = min(1.0, max(0.0, done / total))
+    return int(SCAN_PCT_START + (SCAN_PCT_END - SCAN_PCT_START) * ratio)
+
+
+def fast_scan_tempdir(
+    tempdir: str | Path,
+    pattern_path: str | Path,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Single-pass secret scan: walk each file once, apply all patterns.
+
+    Upstream APKLeaks.scanning() walks the whole tree once per regex (~95 full
+    passes), which looks frozen at a fixed UI percent for many minutes.
+    """
+    rules = _compile_pattern_rules(pattern_path)
+    files: list[str] = []
+    for fp, _, fnames in os.walk(tempdir):
+        for fn in fnames:
+            files.append(os.path.join(fp, fn))
+
+    found: dict[str, set[str]] = {}
+    total = len(files)
+    last_report = 0
+    report_every = max(1, total // 40) if total else 1
+
+    if on_progress:
+        on_progress(0, total)
+
+    for idx, filepath in enumerate(files, 1):
+        try:
+            with open(filepath, encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    for name, matcher in rules:
+                        mo = matcher.search(line)
+                        if not mo:
+                            continue
+                        secret = mo.group()
+                        if name == "LinkFinder":
+                            secret = _filter_linkfinder_secret(secret)
+                            if secret is None:
+                                continue
+                        found.setdefault(name, set()).add(secret)
+        except OSError:
+            pass
+
+        if on_progress and (idx == total or idx - last_report >= report_every):
+            last_report = idx
+            on_progress(idx, total)
+
+    results: list[dict[str, Any]] = []
+    for name, matches in found.items():
+        if matches:
+            results.append({"name": name, "matches": sorted(matches)})
+    return results
+
+
+def _fast_scanning(
+    runner: Any,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> None:
+    """Replace runner.scanning() with single-pass walk + live progress."""
+    package = ""
+    apk_obj = getattr(runner, "apk", None)
+    if apk_obj is not None:
+        package = getattr(apk_obj, "package", "") or ""
+    runner.out_json["package"] = package
+    runner.out_json["results"] = []
+    results = fast_scan_tempdir(runner.tempdir, runner.pattern, on_progress=on_progress)
+    runner.out_json["results"] = results
+    if results:
+        runner.scanned = True
+
+
 def _scan_one(
     apk: Path,
     severity: str | None,
     pattern: str | None,
     jadx_args: str | None,
-    on_phase: Callable[[str, str], None] | None = None,
+    on_phase: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
-    """Scan one APK with optional phase callbacks: on_phase(phase, message)."""
+    """Scan one APK with optional phase callbacks: on_phase(phase, message, percent=None)."""
     cli = _load_cli()
 
-    def phase(name: str, message: str) -> None:
+    def phase(name: str, message: str, percent: int | None = None) -> None:
         if on_phase:
-            on_phase(name, message)
+            on_phase(name, message, percent)
 
     phase("starting", "Preparing scanner")
     if not apk.is_file():
@@ -240,10 +351,19 @@ def _scan_one(
         phase("decompiling", "Decompiling with jadx (this can take a while)")
         runner.decompile()
 
-        phase("scanning", "Matching secret patterns")
-        runner.scanning()
+        def on_scan_progress(done: int, total: int) -> None:
+            pct = _scan_percent(done, total)
+            if total <= 0:
+                phase("scanning", "No decompiled files to scan", pct)
+            else:
+                phase("scanning", f"Scanning files {done}/{total}", pct)
 
-        phase("classifying", "Classifying findings")
+        phase("scanning", "Matching secret patterns (single pass)", SCAN_PCT_START)
+        # Single-pass walk — upstream scanning() re-walks the tree per regex and
+        # freezes the UI at a fixed percent for a very long time.
+        _fast_scanning(runner, on_progress=on_scan_progress)
+
+        phase("classifying", "Classifying findings", PHASE_PERCENT["classifying"])
         raw_results = runner.out_json.copy()
         results_list = raw_results.get("results", [])
         classified = cli._classify_findings(results_list)
@@ -380,25 +500,48 @@ def run_batch(
 
     progress = tqdm(total=len(apks), desc="Scanning APKs", unit="apk") if tqdm else None
 
-    def set_phase(name: str, phase: str, message: str) -> None:
+    def set_phase(
+        name: str,
+        phase: str,
+        message: str,
+        percent: int | None = None,
+    ) -> None:
         with _STATUS_LOCK:
             info = status["active"].get(name) or {}
             if "_started_ts" not in info:
                 info["_started_ts"] = time.time()
                 info["started_at"] = _utc_now()
+            pct = int(percent) if percent is not None else PHASE_PERCENT.get(phase, 0)
+            pct = max(0, min(100, pct))
+            prev_phase = info.get("phase")
+            prev_pct = info.get("percent")
+            prev_msg = info.get("message")
+            now = time.time()
+            last_write = float(info.get("_last_write_ts") or 0.0)
             info.update(
                 {
                     "apk": name,
                     "phase": phase,
-                    "percent": PHASE_PERCENT.get(phase, 0),
+                    "percent": pct,
                     "message": message,
-                    "elapsed_ms": int((time.time() - info["_started_ts"]) * 1000),
+                    "elapsed_ms": int((now - info["_started_ts"]) * 1000),
                 }
             )
             status["active"][name] = info
             if name not in status["current"] and phase not in ("done", "failed"):
                 status["current"].append(name)
-            _write_status(status_file, status)
+            # Throttle disk writes during dense scanning progress updates.
+            changed = (
+                phase != prev_phase
+                or message != prev_msg
+                or prev_pct is None
+                or abs(pct - int(prev_pct)) >= 2
+                or phase in ("done", "failed", "classifying")
+                or (now - last_write) >= 1.5
+            )
+            if changed:
+                info["_last_write_ts"] = now
+                _write_status(status_file, status)
 
     def mark_start(name: str) -> None:
         with _STATUS_LOCK:
@@ -484,8 +627,8 @@ def run_batch(
     def _worker(apk: Path) -> dict[str, Any]:
         mark_start(apk.name)
 
-        def on_phase(phase: str, message: str) -> None:
-            set_phase(apk.name, phase, message)
+        def on_phase(phase: str, message: str, percent: int | None = None) -> None:
+            set_phase(apk.name, phase, message, percent)
 
         try:
             return _scan_one(apk, severity, pattern, jadx_args, on_phase=on_phase)

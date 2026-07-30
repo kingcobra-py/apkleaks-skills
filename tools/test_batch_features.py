@@ -13,7 +13,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from batch_scan import discover_apks, _interesting_hits  # noqa: E402
+from batch_scan import (  # noqa: E402
+    discover_apks,
+    _interesting_hits,
+    _scan_percent,
+    fast_scan_tempdir,
+    SCAN_PCT_START,
+    SCAN_PCT_END,
+)
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
 
@@ -55,6 +62,48 @@ class BatchHelperTests(unittest.TestCase):
         self.assertTrue(hits["aws"])
         self.assertTrue(hits["sendgrid"])
         self.assertTrue(hits["stripe"])
+
+    def test_scan_percent_maps_range(self):
+        self.assertEqual(_scan_percent(0, 100), SCAN_PCT_START)
+        self.assertEqual(_scan_percent(100, 100), SCAN_PCT_END)
+        mid = _scan_percent(50, 100)
+        self.assertGreater(mid, SCAN_PCT_START)
+        self.assertLess(mid, SCAN_PCT_END)
+
+
+class FastScanTests(unittest.TestCase):
+    def test_single_pass_finds_secret_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_text(
+                'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n',
+                encoding="utf-8",
+            )
+            (root / "b.txt").write_text("nothing here\n", encoding="utf-8")
+            patterns = {
+                "AWS_Secret_Access_Key": (
+                    r"(?i)aws[_-]?secret[_-]?access[_-]?key"
+                    r".{0,32}['\"]?([A-Za-z0-9/+=]{40})['\"]?"
+                ),
+                "Generic_API_Key": r"example_api_token_[a-z0-9]+",
+            }
+            pattern_file = root / "patterns.json"
+            pattern_file.write_text(json.dumps(patterns), encoding="utf-8")
+            progress: list[tuple[int, int]] = []
+
+            results = fast_scan_tempdir(
+                root,
+                pattern_file,
+                on_progress=lambda done, total: progress.append((done, total)),
+            )
+
+            names = {r["name"] for r in results}
+            self.assertIn("AWS_Secret_Access_Key", names)
+            self.assertTrue(progress)
+            self.assertEqual(progress[0][0], 0)
+            self.assertEqual(progress[-1][0], progress[-1][1])
+            # patterns.json itself is walked; at least the two text files + json
+            self.assertGreaterEqual(progress[-1][1], 2)
 
 
 class ResultsFormatTests(unittest.TestCase):
