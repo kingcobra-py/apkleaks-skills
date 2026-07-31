@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -114,8 +115,16 @@ _SKIP_DIR_PARTS = (
     "/res/raw/",
     "/assets/fonts/",
 )
-_MAX_SCAN_FILE_BYTES = 1_500_000
+_MAX_SCAN_FILE_BYTES = 800_000
+_MAX_JS_SCAN_FILE_BYTES = 200_000
 _JADX_TIMEOUT_SEC = 240
+# Hard wall-clock limit per APK (subprocess kill). Prevents 3h+ stuck workers.
+_APK_TIMEOUT_SEC = 900
+# Cooperative deadline for the regex pass inside a worker.
+_SCAN_PHASE_TIMEOUT_SEC = 600
+# Bail out of a single huge/minified file after this many seconds of matching.
+_PER_FILE_BUDGET_SEC = 2.5
+_MINIFIED_EXTS = {".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".htm", ".json"}
 
 # Patterns that are expensive and low-value for batch high-severity secret hunting.
 _SKIP_PATTERN_NAMES = {
@@ -131,6 +140,9 @@ _SKIP_PATTERN_NAMES = {
     "HackerOne_CTF_Flag",
     "HackTheBox_CTF_Flag",
     "TryHackMe_CTF_Flag",
+    # Broad / catastrophic on minified bundles — low signal for secret hunting.
+    "Password_in_URL",
+    "Generic_Password",
 }
 
 
@@ -312,10 +324,42 @@ def _should_scan_file(path: str) -> bool:
     for part in _SKIP_DIR_PARTS:
         if part in lower:
             return False
+    # Bundled web assets are usually minified and dominate scan time.
+    if "/assets/" in lower and os.path.splitext(lower)[1] in _MINIFIED_EXTS:
+        # Still allow small config-ish JSON under assets.
+        if lower.endswith(".json"):
+            try:
+                if os.path.getsize(path) <= 64_000:
+                    return True
+            except OSError:
+                return False
+        return False
     ext = os.path.splitext(lower)[1]
     if ext in _SCAN_EXTENSIONS:
         return True
     # Small extensionless text files (rare) — skip by default.
+    return False
+
+
+def _max_bytes_for_path(path: str) -> int:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _MINIFIED_EXTS:
+        return _MAX_JS_SCAN_FILE_BYTES
+    return _MAX_SCAN_FILE_BYTES
+
+
+def _looks_minified(data: str, path: str) -> bool:
+    """Detect webpack/minified bundles that make regex matching pathological."""
+    if len(data) < 40_000:
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _MINIFIED_EXTS and ext not in {".java", ".xml"}:
+        return False
+    newlines = data.count("\n")
+    if newlines <= 5 and len(data) >= 40_000:
+        return True
+    if newlines > 0 and (len(data) / newlines) >= 800:
+        return True
     return False
 
 
@@ -339,6 +383,7 @@ def fast_scan_tempdir(
     pattern_path: str | Path,
     on_progress: Callable[[int, int], None] | None = None,
     severity: str | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Single-pass secret scan: walk each file once, apply all patterns.
 
@@ -360,6 +405,8 @@ def fast_scan_tempdir(
                 "okhttp3",
                 "okio",
                 "META-INF",
+                "node_modules",
+                "webpack",
             }
         ]
         for fn in fnames:
@@ -371,20 +418,33 @@ def fast_scan_tempdir(
     total = len(files)
     last_report = 0
     report_every = max(1, total // 40) if total else 1
+    timed_out = False
 
     if on_progress:
         on_progress(0, total)
 
     for idx, filepath in enumerate(files, 1):
+        if deadline is not None and time.time() >= deadline:
+            timed_out = True
+            if on_progress:
+                on_progress(idx, total)
+            break
         try:
             size = os.path.getsize(filepath)
-            if size <= 0 or size > _MAX_SCAN_FILE_BYTES:
+            max_bytes = _max_bytes_for_path(filepath)
+            if size <= 0 or size > max_bytes:
                 pass
             else:
                 with open(filepath, encoding="utf-8", errors="ignore") as handle:
                     data = handle.read()
-                if data:
+                if data and not _looks_minified(data, filepath):
+                    file_deadline = time.time() + _PER_FILE_BUDGET_SEC
                     for name, matcher in rules:
+                        if time.time() >= file_deadline:
+                            break
+                        if deadline is not None and time.time() >= deadline:
+                            timed_out = True
+                            break
                         for mo in matcher.finditer(data):
                             secret = mo.group()
                             if name == "LinkFinder":
@@ -392,12 +452,24 @@ def fast_scan_tempdir(
                                 if secret is None:
                                     continue
                             found.setdefault(name, set()).add(secret)
+                        if timed_out:
+                            break
         except OSError:
             pass
 
         if on_progress and (idx == total or idx - last_report >= report_every):
             last_report = idx
             on_progress(idx, total)
+        if timed_out:
+            break
+
+    if timed_out:
+        LOG.warning(
+            "Scan phase hit deadline after %s/%s files under %s",
+            last_report or 0,
+            total,
+            tempdir,
+        )
 
     results: list[dict[str, Any]] = []
     for name, matches in found.items():
@@ -443,6 +515,7 @@ def _fast_scanning(
     runner: Any,
     on_progress: Callable[[int, int], None] | None = None,
     severity: str | None = None,
+    deadline: float | None = None,
 ) -> None:
     """Replace runner.scanning() with single-pass walk + live progress."""
     package = ""
@@ -456,6 +529,7 @@ def _fast_scanning(
         runner.pattern,
         on_progress=on_progress,
         severity=severity,
+        deadline=deadline,
     )
     runner.out_json["results"] = results
     if results:
@@ -553,7 +627,13 @@ def _scan_one(
         phase("scanning", "Matching secret patterns (single pass)", SCAN_PCT_START)
         # Single-pass walk — upstream scanning() re-walks the tree per regex and
         # freezes the UI at a fixed percent for a very long time.
-        _fast_scanning(runner, on_progress=on_scan_progress, severity=severity)
+        scan_deadline = time.time() + _SCAN_PHASE_TIMEOUT_SEC
+        _fast_scanning(
+            runner,
+            on_progress=on_scan_progress,
+            severity=severity,
+            deadline=scan_deadline,
+        )
 
         phase("classifying", "Classifying findings", PHASE_PERCENT["classifying"])
         raw_results = runner.out_json.copy()
@@ -733,6 +813,193 @@ def discover_apks(input_path: Path) -> list[Path]:
     return sorted(p for p in input_path.rglob("*.apk") if p.is_file())
 
 
+def _empty_failed_job(
+    apk: Path,
+    error: str,
+    error_code: str = "SCAN_FAILED",
+    duration_ms: int = 0,
+) -> dict[str, Any]:
+    return {
+        "apk": apk.name,
+        "path": str(apk),
+        "ok": False,
+        "error": error,
+        "error_code": error_code,
+        "duration_ms": duration_ms,
+        "has_critical": False,
+        "finding_count": 0,
+        "findings": [],
+        "raw_lines": [],
+        "priority_lines": [],
+        "other_lines": [],
+        "aws_pairs": [],
+        "firebase_access": [],
+        "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
+        "phase": "failed",
+    }
+
+
+def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    """Best-effort kill of a worker process group (jadx children included)."""
+    try:
+        if proc.pid:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def run_one_apk(
+    apk: Path,
+    severity: str | None,
+    pattern: str | None,
+    jadx_args: str | None,
+    out_path: Path,
+    progress_path: Path | None = None,
+) -> dict[str, Any]:
+    """Scan a single APK in this process and write the result JSON."""
+
+    def on_phase(phase: str, message: str, percent: int | None = None) -> None:
+        if progress_path is None:
+            return
+        payload = {
+            "apk": apk.name,
+            "phase": phase,
+            "message": message,
+            "percent": percent,
+            "updated_at": _utc_now(),
+        }
+        try:
+            progress_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = progress_path.with_suffix(progress_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(progress_path)
+        except OSError:
+            pass
+
+    job = _scan_one(apk, severity, pattern, jadx_args, on_phase=on_phase)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("Failed to write one-apk result for %s: %s", apk.name, exc)
+    return job
+
+
+def _scan_apk_subprocess(
+    apk: Path,
+    *,
+    severity: str | None,
+    pattern: str | None,
+    jadx_args: str | None,
+    output_dir: Path,
+    timeout_sec: int,
+    on_phase: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    """Run one APK in an isolated subprocess so hung regex/jadx can be killed."""
+    out_path = output_dir / f"{apk.stem}.json"
+    progress_path = output_dir / f".progress-{apk.stem}.json"
+    script = str(Path(__file__).resolve())
+    cmd = [
+        sys.executable,
+        script,
+        "--one",
+        str(apk),
+        "--one-out",
+        str(out_path),
+        "--one-progress",
+        str(progress_path),
+    ]
+    if severity:
+        cmd.extend(["-s", severity])
+    if pattern:
+        cmd.extend(["-p", pattern])
+    if jadx_args:
+        cmd.extend(["-a", jadx_args])
+
+    started = time.time()
+    try:
+        if progress_path.is_file():
+            progress_path.unlink()
+    except OSError:
+        pass
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return _empty_failed_job(apk, f"Failed to spawn worker: {exc}")
+
+    last_progress_read = 0.0
+    try:
+        while True:
+            rc = proc.poll()
+            now = time.time()
+            if on_phase and now - last_progress_read >= 0.75 and progress_path.is_file():
+                last_progress_read = now
+                try:
+                    prog = json.loads(progress_path.read_text(encoding="utf-8"))
+                    on_phase(
+                        str(prog.get("phase") or "scanning"),
+                        str(prog.get("message") or "Scanning"),
+                        prog.get("percent"),
+                    )
+                except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            if rc is not None:
+                break
+            if now - started >= timeout_sec:
+                _kill_process_tree(proc)
+                duration_ms = int((time.time() - started) * 1000)
+                if on_phase:
+                    on_phase("failed", f"Timed out after {timeout_sec}s", 100)
+                return _empty_failed_job(
+                    apk,
+                    f"Timed out after {timeout_sec}s",
+                    error_code="TIMEOUT",
+                    duration_ms=duration_ms,
+                )
+            time.sleep(0.5)
+    finally:
+        if proc.poll() is None:
+            _kill_process_tree(proc)
+        try:
+            if progress_path.is_file():
+                progress_path.unlink()
+        except OSError:
+            pass
+
+    duration_ms = int((time.time() - started) * 1000)
+    if out_path.is_file():
+        try:
+            job = json.loads(out_path.read_text(encoding="utf-8"))
+            if isinstance(job, dict) and "apk" in job:
+                job.setdefault("duration_ms", duration_ms)
+                return job
+        except (OSError, json.JSONDecodeError) as exc:
+            return _empty_failed_job(
+                apk,
+                f"Invalid worker result: {exc}",
+                duration_ms=duration_ms,
+            )
+    return _empty_failed_job(
+        apk,
+        f"Worker exited with code {proc.returncode} and no result file",
+        duration_ms=duration_ms,
+    )
+
+
 def run_batch(
     input_dir: Path,
     output_dir: Path,
@@ -741,6 +1008,7 @@ def run_batch(
     pattern: str | None = None,
     jadx_args: str | None = None,
     status_path: Path | None = None,
+    apk_timeout: int = _APK_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     apks = discover_apks(input_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,27 +1304,20 @@ def run_batch(
             set_phase(apk.name, phase, message, percent)
 
         try:
-            return _scan_one(apk, severity, pattern, jadx_args, on_phase=on_phase)
+            # Isolated subprocess so a pathological regex/jadx hang can be SIGKILL'd
+            # after apk_timeout — in-thread workers were stuck for hours.
+            return _scan_apk_subprocess(
+                apk,
+                severity=severity,
+                pattern=pattern,
+                jadx_args=jadx_args,
+                output_dir=output_dir,
+                timeout_sec=max(60, int(apk_timeout)),
+                on_phase=on_phase,
+            )
         except Exception as exc:  # noqa: BLE001
             set_phase(apk.name, "failed", str(exc)[:120])
-            return {
-                "apk": apk.name,
-                "path": str(apk),
-                "ok": False,
-                "error": str(exc),
-                "error_code": "SCAN_FAILED",
-                "duration_ms": 0,
-                "has_critical": False,
-                "finding_count": 0,
-                "findings": [],
-                "raw_lines": [],
-                "priority_lines": [],
-                "other_lines": [],
-                "aws_pairs": [],
-                "firebase_access": [],
-                "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
-                "phase": "failed",
-            }
+            return _empty_failed_job(apk, str(exc))
 
     # Heartbeat thread so elapsed_ms / updated_at keep moving during long jadx runs
     stop_heartbeat = threading.Event()
@@ -1255,7 +1516,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Scan multiple APKs in parallel with progress + status JSON",
     )
-    parser.add_argument("-d", "--dir", required=True, help="Directory of APK files (or a single .apk)")
+    parser.add_argument("-d", "--dir", default=None, help="Directory of APK files (or a single .apk)")
     parser.add_argument("-o", "--output", default="results", help="Output directory (default: results)")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Worker threads (default: 4)")
     parser.add_argument(
@@ -1268,6 +1529,15 @@ def main() -> int:
     parser.add_argument("-p", "--pattern", default=None, help="Custom patterns JSON")
     parser.add_argument("-a", "--args", dest="jadx_args", default=None, help="Extra jadx args")
     parser.add_argument("--status", default=None, help="Status JSON path (default: <output>/status.json)")
+    parser.add_argument(
+        "--apk-timeout",
+        type=int,
+        default=_APK_TIMEOUT_SEC,
+        help=f"Hard per-APK timeout seconds (default: {_APK_TIMEOUT_SEC})",
+    )
+    parser.add_argument("--one", default=None, help="Scan a single APK path and exit (worker mode)")
+    parser.add_argument("--one-out", default=None, help="Result JSON path for --one")
+    parser.add_argument("--one-progress", default=None, help="Live progress JSON path for --one")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logs")
     args = parser.parse_args()
 
@@ -1276,6 +1546,28 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.one:
+        apk = Path(args.one)
+        if not apk.is_file():
+            LOG.error("APK not found: %s", apk)
+            return 2
+        out_path = Path(args.one_out) if args.one_out else Path(args.output) / f"{apk.stem}.json"
+        progress_path = Path(args.one_progress) if args.one_progress else None
+        job = run_one_apk(
+            apk,
+            severity=args.severity,
+            pattern=args.pattern,
+            jadx_args=args.jadx_args,
+            out_path=out_path,
+            progress_path=progress_path,
+        )
+        print(json.dumps({"ok": bool(job.get("ok")), "apk": job.get("apk"), "error": job.get("error")}))
+        return 0 if job.get("ok") else 1
+
+    if not args.dir:
+        LOG.error("-d/--dir is required unless --one is set")
+        return 2
 
     try:
         status = run_batch(
@@ -1286,6 +1578,7 @@ def main() -> int:
             pattern=args.pattern,
             jadx_args=args.jadx_args,
             status_path=Path(args.status) if args.status else None,
+            apk_timeout=max(60, int(args.apk_timeout)),
         )
     except FileNotFoundError as exc:
         LOG.error("%s", exc)

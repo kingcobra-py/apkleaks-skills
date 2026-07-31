@@ -131,8 +131,9 @@ def _default_config() -> dict:
         "download_source": "fdroid",
         "loop_enabled": False,
         "loop_apps": 100,
-        "loop_threads": 12,
+        "loop_threads": 6,
         "loop_download_workers": 10,
+        "apk_timeout": 900,
         "severity": "high",
         "apks_dir": str(APKS_DIR),
         "results_dir": str(RESULTS_DIR),
@@ -148,14 +149,16 @@ def load_config() -> dict:
                 cfg.update(data)
         except json.JSONDecodeError:
             pass
-    cfg["threads"] = max(1, min(32, int(cfg.get("threads") or 4)))
+    # Cap concurrency — 15+ parallel regex scanners on huge APKs freeze for hours.
+    cfg["threads"] = max(1, min(12, int(cfg.get("threads") or 4)))
     cfg["download_count"] = max(1, min(5000, int(cfg.get("download_count") or 100)))
     cfg["download_workers"] = max(1, min(32, int(cfg.get("download_workers") or 10)))
     cfg["loop_apps"] = max(1, min(5000, int(cfg.get("loop_apps") or 100)))
-    cfg["loop_threads"] = max(1, min(32, int(cfg.get("loop_threads") or cfg["threads"])))
+    cfg["loop_threads"] = max(1, min(12, int(cfg.get("loop_threads") or cfg["threads"])))
     cfg["loop_download_workers"] = max(
         1, min(32, int(cfg.get("loop_download_workers") or cfg["download_workers"]))
     )
+    cfg["apk_timeout"] = max(60, min(3600, int(cfg.get("apk_timeout") or 900)))
     cfg["loop_enabled"] = bool(cfg.get("loop_enabled"))
     cfg["download_source"] = _normalize_download_source(cfg.get("download_source"))
     return cfg
@@ -165,14 +168,15 @@ def save_config(cfg: dict) -> dict:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     merged = load_config()
     merged.update(cfg)
-    merged["threads"] = max(1, min(32, int(merged.get("threads") or 4)))
+    merged["threads"] = max(1, min(12, int(merged.get("threads") or 4)))
     merged["download_count"] = max(1, min(5000, int(merged.get("download_count") or 100)))
     merged["download_workers"] = max(1, min(32, int(merged.get("download_workers") or 10)))
     merged["loop_apps"] = max(1, min(5000, int(merged.get("loop_apps") or 100)))
-    merged["loop_threads"] = max(1, min(32, int(merged.get("loop_threads") or merged["threads"])))
+    merged["loop_threads"] = max(1, min(12, int(merged.get("loop_threads") or merged["threads"])))
     merged["loop_download_workers"] = max(
         1, min(32, int(merged.get("loop_download_workers") or merged["download_workers"]))
     )
+    merged["apk_timeout"] = max(60, min(3600, int(merged.get("apk_timeout") or 900)))
     merged["loop_enabled"] = bool(merged.get("loop_enabled"))
     merged["download_source"] = _normalize_download_source(merged.get("download_source"))
     CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
@@ -1129,7 +1133,8 @@ def start_scan(threads: int | None = None) -> dict:
     venv_python = ROOT / ".venv" / "bin" / "python3"
     python = str(venv_python) if venv_python.is_file() else sys.executable
     # With many APK workers, jadx -j 2 multiplies JVM load; keep jadx single-threaded.
-    jadx_jobs = 1 if threads_n >= 8 else 2
+    jadx_jobs = 1 if threads_n >= 6 else 2
+    apk_timeout = int(cfg.get("apk_timeout") or 900)
     cmd = [
         python,
         str(TOOLS / "batch_scan.py"),
@@ -1143,6 +1148,8 @@ def start_scan(threads: int | None = None) -> dict:
         str(cfg.get("severity") or "high"),
         "-a",
         f"-j {jadx_jobs}",
+        "--apk-timeout",
+        str(apk_timeout),
         "--status",
         str(RESULTS_DIR / "status.json"),
     ]
@@ -1616,8 +1623,8 @@ class StatusHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "error": "threads must be an integer"}, 400)
                 return
-            if threads < 1 or threads > 32:
-                self._json({"ok": False, "error": "threads must be 1..32"}, 400)
+            if threads < 1 or threads > 12:
+                self._json({"ok": False, "error": "threads must be 1..12"}, 400)
                 return
             restart = bool(body.get("restart", True))
             cfg = save_config({"threads": threads})
@@ -1647,8 +1654,8 @@ class StatusHandler(BaseHTTPRequestHandler):
             if apps < 1 or apps > 5000:
                 self._json({"ok": False, "error": "apps must be 1..5000"}, 400)
                 return
-            if threads < 1 or threads > 32:
-                self._json({"ok": False, "error": "threads must be 1..32"}, 400)
+            if threads < 1 or threads > 12:
+                self._json({"ok": False, "error": "threads must be 1..12"}, 400)
                 return
             if workers < 1 or workers > 32:
                 self._json({"ok": False, "error": "download_workers must be 1..32"}, 400)

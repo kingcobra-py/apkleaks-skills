@@ -871,10 +871,10 @@ const DashboardPage: React.FC = () => {
           <Card className="glass-card" title={<Space><ThunderboltOutlined /> Scan threads</Space>}>
             <Space direction="vertical" style={{ width: '100%' }} size="middle">
               <div>
-                <Text type="secondary">Worker threads (1–32)</Text>
+                <Text type="secondary">Worker threads (1–12)</Text>
                 <InputNumber
                   min={1}
-                  max={32}
+                  max={12}
                   value={threads}
                   onChange={(v) => setThreads(Number(v || 1))}
                   style={{ width: '100%', marginTop: 8 }}
@@ -951,10 +951,10 @@ const DashboardPage: React.FC = () => {
                 />
               </Col>
               <Col xs={24} md={6}>
-                <Text type="secondary">Scan threads</Text>
+                <Text type="secondary">Scan threads (max 12)</Text>
                 <InputNumber
                   min={1}
-                  max={32}
+                  max={12}
                   value={loopThreads}
                   onChange={(v) => setLoopThreads(Number(v || 1))}
                   style={{ width: '100%', marginTop: 8 }}

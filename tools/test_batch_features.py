@@ -16,7 +16,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 from batch_scan import (  # noqa: E402
     discover_apks,
     _interesting_hits,
+    _looks_minified,
     _scan_percent,
+    _should_scan_file,
     fast_scan_tempdir,
     SCAN_PCT_START,
     SCAN_PCT_END,
@@ -114,6 +116,34 @@ class FastScanTests(unittest.TestCase):
             self.assertEqual(progress[-1][0], progress[-1][1])
             # patterns.json itself is walked; at least the two text files + json
             self.assertGreaterEqual(progress[-1][1], 2)
+
+    def test_skips_minified_and_respects_deadline(self):
+        self.assertTrue(_looks_minified("x" * 50_000, "bundle.js"))
+        self.assertFalse(_looks_minified("short\n", "bundle.js"))
+        self.assertFalse(
+            _should_scan_file("/tmp/out/resources/assets/viewer/js/worker.js")
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ok.java").write_text(
+                'aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n',
+                encoding="utf-8",
+            )
+            patterns = {
+                "AWS_Secret_Access_Key": (
+                    r"(?i)aws[_-]?secret[_-]?access[_-]?key"
+                    r".{0,32}['\"]?([A-Za-z0-9/+=]{40})['\"]?"
+                ),
+            }
+            pattern_file = root / "patterns.json"
+            pattern_file.write_text(json.dumps(patterns), encoding="utf-8")
+            # Deadline already in the past → must return quickly with no hang.
+            results = fast_scan_tempdir(
+                root,
+                pattern_file,
+                deadline=0.0,
+            )
+            self.assertEqual(results, [])
 
 
 class FdroidDedupTests(unittest.TestCase):
