@@ -29,6 +29,7 @@ from fdroid_download import (  # noqa: E402
 )
 import apk_download  # noqa: E402
 import admin_sdk_detect  # noqa: E402
+import db_url_detect  # noqa: E402
 import firebase_probe  # noqa: E402
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
@@ -230,6 +231,75 @@ class ApkDownloadSourceTests(unittest.TestCase):
         })
         self.assertIn("com.demo.app", resolved["url"])
         self.assertEqual(resolved["apkName"], "com.demo.app_9.apk")
+
+
+class DbUrlDetectTests(unittest.TestCase):
+    def test_postgres_with_creds_is_critical(self):
+        job = {
+            "apk": "db.apk",
+            "findings": [
+                {
+                    "name": "PostgreSQL_URI",
+                    "matches": ["postgres://appuser:s3cret@db.example.com:5432/prod"],
+                }
+            ],
+        }
+        hits = db_url_detect.detect_db_urls(job)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["kind"], "postgres")
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertTrue(hits[0]["has_credentials"])
+        self.assertIn("***", hits[0]["value_redacted"])
+        self.assertNotIn("s3cret", hits[0]["value_redacted"])
+
+    def test_mongodb_and_redis(self):
+        job = {
+            "apk": "multi.apk",
+            "findings": [
+                {"name": "MongoDB_URI", "matches": ["mongodb+srv://u:p@cluster0.abc.mongodb.net/app"]},
+                {"name": "Redis_URI", "matches": ["redis://:pass@cache.internal:6379/0"]},
+            ],
+        }
+        hits = db_url_detect.detect_db_urls(job)
+        kinds = {h["kind"] for h in hits}
+        self.assertIn("mongodb", kinds)
+        self.assertIn("redis", kinds)
+
+    def test_placeholder_user_pass_filtered(self):
+        job = {
+            "apk": "demo.apk",
+            "findings": [
+                {"name": "MySQL_URI", "matches": ["mysql://user:pass@localhost:3306/db"]},
+            ],
+        }
+        hits = db_url_detect.detect_db_urls(job)
+        self.assertEqual(hits, [])
+
+    def test_local_real_creds_kept(self):
+        job = {
+            "apk": "demo.apk",
+            "findings": [
+                {"name": "MySQL_URI", "matches": ["mysql://appuser:RealPass99@localhost:3306/db"]},
+            ],
+        }
+        hits = db_url_detect.detect_db_urls(job)
+        self.assertTrue(hits)
+        self.assertTrue(hits[0]["local"])
+        self.assertEqual(hits[0]["severity"], "high")
+
+    def test_normalize_priority(self):
+        job = {
+            "apk": "db.apk",
+            "findings": [
+                {
+                    "name": "PostgreSQL_URI",
+                    "matches": ["postgres://appuser:s3cret@db.example.com:5432/prod"],
+                }
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertTrue(any(x.startswith("DB_URL:") for x in norm["priority_lines"]))
+        self.assertTrue(norm.get("has_db_urls"))
 
 
 class AdminSdkDetectTests(unittest.TestCase):

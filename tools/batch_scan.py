@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 from admin_sdk_detect import detect_admin_sdk, merge_admin_sdk  # noqa: E402
+from db_url_detect import detect_db_urls, merge_db_urls  # noqa: E402
 from firebase_probe import hosts_from_job, merge_firebase_results, probe_job  # noqa: E402
 from results_format import aggregate_results, normalize_job_findings  # noqa: E402
 
@@ -178,6 +179,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
             "has_stripe": 0,
             "firebase_dumpable": 0,
             "admin_sdk": 0,
+            "db_urls": 0,
         },
         "current": [],
         "active": {},  # apk -> live phase info
@@ -189,6 +191,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
         "aws_pairs": [],
         "firebase_access": [],
         "admin_sdk": [],
+        "db_urls": [],
     }
 
 
@@ -259,6 +262,7 @@ def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
         "firebase_access": firebase,
         "firebase_dumpable": sum(1 for r in firebase if r.get("dumpable")),
         "admin_sdk": job.get("admin_sdk") or [],
+        "db_urls": job.get("db_urls") or [],
         "hits": job.get("hits") or {},
         "phase": job.get("phase") or ("done" if job.get("ok") else "failed"),
     }
@@ -594,6 +598,22 @@ def _scan_one(
                 admin_sdk = []
         if any(h.get("severity") in ("critical", "high") for h in admin_sdk):
             hits["admin_sdk"] = True
+        db_urls = list(norm.get("db_urls") or [])
+        if not db_urls:
+            try:
+                db_urls = detect_db_urls({
+                    "apk": apk.name,
+                    "package": classified.get("package") or "",
+                    "findings": findings,
+                    "raw_lines": norm["raw_lines"],
+                    "priority_lines": norm["priority_lines"],
+                    "other_lines": norm["other_lines"],
+                })
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("DB URL detect failed for %s: %s", apk.name, exc)
+                db_urls = []
+        if any(h.get("severity") in ("critical", "high") for h in db_urls):
+            hits["db_urls"] = True
         firebase_access: list[dict[str, Any]] = []
         probe_input = {
             "apk": apk.name,
@@ -616,11 +636,13 @@ def _scan_one(
         error_code = "NO_FINDINGS" if classified.get("total_findings", 0) == 0 else None
         dumpable_n = sum(1 for r in firebase_access if r.get("dumpable"))
         admin_n = sum(1 for h in admin_sdk if h.get("severity") in ("critical", "high"))
+        db_n = sum(1 for h in db_urls if h.get("severity") in ("critical", "high"))
         phase(
             "done",
             f"Done — {norm['finding_count']} secret(s)"
             + (f", {dumpable_n} dumpable Firebase" if dumpable_n else "")
-            + (f", {admin_n} Admin SDK" if admin_n else ""),
+            + (f", {admin_n} Admin SDK" if admin_n else "")
+            + (f", {db_n} DB URL" if db_n else ""),
         )
         return {
             "apk": apk.name,
@@ -637,6 +659,7 @@ def _scan_one(
             "other_lines": norm["other_lines"],
             "aws_pairs": norm["aws_pairs"],
             "admin_sdk": admin_sdk,
+            "db_urls": db_urls,
             "firebase_access": firebase_access,
             "hits": hits,
             "phase": "done",
@@ -791,6 +814,22 @@ def run_batch(
                 status["admin_sdk"] = merged_sa
                 status["counts"]["admin_sdk"] = sum(
                     1 for r in merged_sa if r.get("severity") in ("critical", "high")
+                )
+            db_rows: list[dict[str, Any]] = []
+            for job in ordered_seed:
+                existing = job.get("db_urls") or []
+                if existing:
+                    db_rows.extend(existing)
+                else:
+                    try:
+                        db_rows.extend(detect_db_urls(job))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if db_rows:
+                merged_db = merge_db_urls(db_rows)
+                status["db_urls"] = merged_db
+                status["counts"]["db_urls"] = sum(
+                    1 for r in merged_db if r.get("severity") in ("critical", "high")
                 )
     except Exception:  # noqa: BLE001
         pass
@@ -947,16 +986,28 @@ def run_batch(
                 status["counts"]["admin_sdk"] = sum(
                     1 for r in merged_sa if r.get("severity") in ("critical", "high")
                 )
+            if job.get("db_urls"):
+                merged_db = merge_db_urls(
+                    list(status.get("db_urls") or []) + list(job.get("db_urls") or [])
+                )
+                status["db_urls"] = merged_db
+                status["counts"]["db_urls"] = sum(
+                    1 for r in merged_db if r.get("severity") in ("critical", "high")
+                )
             level = "info" if job["ok"] else "error"
             dumpable_n = sum(1 for r in (job.get("firebase_access") or []) if r.get("dumpable"))
             admin_n = sum(
                 1 for r in (job.get("admin_sdk") or []) if r.get("severity") in ("critical", "high")
+            )
+            db_n = sum(
+                1 for r in (job.get("db_urls") or []) if r.get("severity") in ("critical", "high")
             )
             msg = (
                 f"Done {job['apk']}: findings={job.get('finding_count', 0)} "
                 f"ok={job['ok']} ({job.get('duration_ms', 0)} ms)"
                 + (f" firebase_dumpable={dumpable_n}" if dumpable_n else "")
                 + (f" admin_sdk={admin_n}" if admin_n else "")
+                + (f" db_urls={db_n}" if db_n else "")
             )
             _append_log(status, level, msg)
             LOG.log(logging.INFO if job["ok"] else logging.ERROR, msg)
@@ -1163,6 +1214,34 @@ def run_batch(
             )
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to write admin-sdk-access.json: %s", exc)
+    try:
+        db_rows: list[dict[str, Any]] = []
+        for _, job in disk_jobs:
+            existing = job.get("db_urls") or []
+            if existing:
+                db_rows.extend(existing)
+            else:
+                db_rows.extend(detect_db_urls(job))
+        if db_rows:
+            merged_db = merge_db_urls(db_rows)
+            status["db_urls"] = merged_db
+            status["counts"]["db_urls"] = sum(
+                1 for r in merged_db if r.get("severity") in ("critical", "high")
+            )
+            (output_dir / "db-urls.json").write_text(
+                json.dumps({
+                    "ok": True,
+                    "total": len(merged_db),
+                    "critical_count": sum(1 for r in merged_db if r.get("severity") == "critical"),
+                    "high_count": sum(1 for r in merged_db if r.get("severity") == "high"),
+                    "with_credentials": sum(1 for r in merged_db if r.get("has_credentials")),
+                    "results": merged_db,
+                    "updated_at": _utc_now(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to write db-urls.json: %s", exc)
     (output_dir / "results.txt").write_text(agg["text"], encoding="utf-8")
     (output_dir / "priority-results.txt").write_text(agg.get("priority_text") or "", encoding="utf-8")
     (output_dir / "other-results.txt").write_text(agg.get("other_text") or "", encoding="utf-8")

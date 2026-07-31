@@ -124,6 +124,31 @@ type AdminSdkStatus = {
   results?: AdminSdkRow[];
   updated_at?: string;
 };
+type DbUrlRow = {
+  kind: string;
+  severity: string;
+  summary: string;
+  value_redacted?: string;
+  has_credentials?: boolean;
+  local?: boolean;
+  apk?: string;
+  package?: string;
+};
+type DbUrlsStatus = {
+  ok?: boolean;
+  running?: boolean;
+  state?: string;
+  message?: string;
+  total?: number;
+  critical_count?: number;
+  high_count?: number;
+  with_credentials?: number;
+  by_kind?: Record<string, number>;
+  critical?: DbUrlRow[];
+  high?: DbUrlRow[];
+  results?: DbUrlRow[];
+  updated_at?: string;
+};
 
 const DOWNLOAD_SOURCE_OPTIONS: { value: DownloadSource; label: string }[] = [
   { value: 'fdroid', label: 'F-Droid (open source)' },
@@ -151,6 +176,7 @@ type SystemStats = {
   loop?: LoopStatus;
   firebase?: FirebaseStatus;
   admin_sdk?: AdminSdkStatus;
+  db_urls?: DbUrlsStatus;
   config?: Config;
 };
 type ActiveApp = {
@@ -192,6 +218,8 @@ type Status = {
   firebase?: FirebaseStatus;
   admin_sdk?: AdminSdkRow[];
   admin_sdk_status?: AdminSdkStatus;
+  db_urls?: DbUrlRow[];
+  db_urls_status?: DbUrlsStatus;
   system?: SystemStats;
   config?: Config;
   loop?: LoopStatus;
@@ -308,10 +336,12 @@ const DashboardPage: React.FC = () => {
   const [busyLoop, setBusyLoop] = useState(false);
   const [busyFirebase, setBusyFirebase] = useState(false);
   const [busyAdminSdk, setBusyAdminSdk] = useState(false);
+  const [busyDbUrls, setBusyDbUrls] = useState(false);
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
   const [firebaseStatus, setFirebaseStatus] = useState<FirebaseStatus | null>(null);
   const [adminSdkStatus, setAdminSdkStatus] = useState<AdminSdkStatus | null>(null);
+  const [dbUrlsStatus, setDbUrlsStatus] = useState<DbUrlsStatus | null>(null);
   const sawLiveRef = useRef(false);
   const formSeededRef = useRef(false);
 
@@ -399,6 +429,22 @@ const DashboardPage: React.FC = () => {
         critical,
         high,
         results: data.admin_sdk,
+      });
+    }
+    const dbu = data.db_urls_status || data.system?.db_urls;
+    if (dbu && !Array.isArray(dbu)) setDbUrlsStatus(dbu);
+    else if (Array.isArray(data.db_urls)) {
+      const critical = data.db_urls.filter((r) => r.severity === 'critical');
+      const high = data.db_urls.filter((r) => r.severity === 'high');
+      setDbUrlsStatus({
+        ok: true,
+        total: data.db_urls.length,
+        critical_count: critical.length,
+        high_count: high.length,
+        with_credentials: data.db_urls.filter((r) => r.has_credentials).length,
+        critical,
+        high,
+        results: data.db_urls,
       });
     }
   }, [applyDemo, seedFormFromConfig]);
@@ -583,6 +629,27 @@ const DashboardPage: React.FC = () => {
     }
   };
 
+  const onScanDbUrls = async () => {
+    setBusyDbUrls(true);
+    try {
+      const res = await apiFetch('/api/db-urls/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to start DB URL scan');
+      } else {
+        message.success(data.message || 'DB URL scan started');
+        if (data.db_urls) setDbUrlsStatus(data.db_urls);
+      }
+      await refresh({ results: false });
+    } finally {
+      setBusyDbUrls(false);
+    }
+  };
+
   const downloadText = (filename: string, text: string) => {
     const body = text.endsWith('\n') || !text ? text : `${text}\n`;
     const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
@@ -627,6 +694,14 @@ const DashboardPage: React.FC = () => {
   const adminSdkHot = adminSdkRows.filter((r) => r.severity === 'critical' || r.severity === 'high');
   const adminSdkRunning = Boolean(
     adminSdk && !Array.isArray(adminSdk) && (adminSdk.running || adminSdk.state === 'running'),
+  );
+  const dbUrls = dbUrlsStatus || view.db_urls_status || sys?.db_urls;
+  const dbUrlRows = (dbUrls && !Array.isArray(dbUrls) ? dbUrls.results : view.db_urls) || [];
+  const dbUrlHot = dbUrlRows.filter(
+    (r) => (r.severity === 'critical' || r.severity === 'high') && r.kind !== 'firebase',
+  );
+  const dbUrlsRunning = Boolean(
+    dbUrls && !Array.isArray(dbUrls) && (dbUrls.running || dbUrls.state === 'running'),
   );
   const activeApps = useMemo(() => {
     const map = view.active || {};
@@ -1203,6 +1278,113 @@ const DashboardPage: React.FC = () => {
       </Row>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <ApiOutlined /> Database URLs
+                <Tag color={dbUrlHot.length ? 'red' : 'default'}>
+                  critical/high:{' '}
+                  {!Array.isArray(dbUrls)
+                    ? (dbUrls?.critical_count || 0) + (dbUrls?.high_count || 0)
+                    : dbUrlHot.length}
+                </Tag>
+                <Tag>
+                  with creds:{' '}
+                  {!Array.isArray(dbUrls)
+                    ? dbUrls?.with_credentials ?? dbUrlRows.filter((r) => r.has_credentials).length
+                    : dbUrlRows.filter((r) => r.has_credentials).length}
+                </Tag>
+                {dbUrlsRunning ? <Tag color="processing">SCANNING</Tag> : null}
+              </Space>
+            }
+            extra={
+              <Button
+                type="primary"
+                danger={dbUrlHot.some((r) => r.has_credentials)}
+                loading={busyDbUrls || dbUrlsRunning}
+                icon={<SyncOutlined spin={dbUrlsRunning} />}
+                onClick={onScanDbUrls}
+              >
+                Scan results for DB URLs
+              </Button>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              Postgres / MySQL / MongoDB / Redis / JDBC / MSSQL / AMQP / CouchDB / Elasticsearch /
+              Supabase / RDS / Cosmos / <Text code>DATABASE_URL</Text> / DB password assignments.
+              Passwords are redacted in the UI. Firebase hosts stay in the Firebase card.
+            </Paragraph>
+            {dbUrlHot.length ? (
+              <Table
+                size="small"
+                pagination={{ pageSize: 8 }}
+                rowKey={(r) => `${r.apk}-${r.summary}`}
+                dataSource={dbUrlHot}
+                columns={[
+                  {
+                    title: 'Severity',
+                    dataIndex: 'severity',
+                    width: 100,
+                    render: (v: string) => (
+                      <Tag color={v === 'critical' ? 'red' : 'orange'}>{v}</Tag>
+                    ),
+                  },
+                  {
+                    title: 'Kind',
+                    dataIndex: 'kind',
+                    width: 120,
+                    render: (v: string) => <Tag>{v}</Tag>,
+                  },
+                  {
+                    title: 'URL / value',
+                    dataIndex: 'value_redacted',
+                    render: (_: string, row: DbUrlRow) => (
+                      <Text code copyable style={{ fontSize: 12 }}>
+                        {row.value_redacted || row.summary}
+                      </Text>
+                    ),
+                  },
+                  {
+                    title: 'Creds',
+                    dataIndex: 'has_credentials',
+                    width: 70,
+                    render: (v: boolean) => (v ? <Tag color="red">yes</Tag> : <Tag>no</Tag>),
+                  },
+                  {
+                    title: 'APK',
+                    dataIndex: 'apk',
+                    render: (v: string) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : '—'),
+                  },
+                ]}
+              />
+            ) : (
+              <Text type="secondary">
+                {dbUrlRows.filter((r) => r.kind !== 'firebase').length
+                  ? 'No critical/high non-Firebase DB URLs yet.'
+                  : 'No database URLs found yet. Click “Scan results for DB URLs” (new patterns apply to new APK scans).'}
+              </Text>
+            )}
+            {!Array.isArray(dbUrls) && dbUrls?.by_kind && Object.keys(dbUrls.by_kind).length ? (
+              <div style={{ marginTop: 12 }}>
+                {Object.entries(dbUrls.by_kind).map(([k, n]) => (
+                  <Tag key={k} style={{ marginBottom: 4 }}>
+                    {k}: {n}
+                  </Tag>
+                ))}
+              </div>
+            ) : null}
+            {!Array.isArray(dbUrls) && dbUrls?.message ? (
+              <div style={{ marginTop: 8 }}>
+                <Text type="secondary">{dbUrls.message}</Text>
+              </div>
+            ) : null}
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} lg={12}>
           <Card
             className="glass-card"
@@ -1220,7 +1402,7 @@ const DashboardPage: React.FC = () => {
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
               AWS <Text code>Key:Secret</Text>, SendGrid (<Text code>SG.</Text>), Stripe{' '}
-              <Text code>sk_live_</Text>, and <Text code>ADMIN_SDK:…</Text> service-account leaks.
+              <Text code>sk_live_</Text>, <Text code>ADMIN_SDK:…</Text>, and <Text code>DB_URL:…</Text>.
             </Paragraph>
             <div style={monoBoxStyle}>
               {priorityLines.length ? priorityLines.join('\n') : <Text type="secondary">No AWS / SendGrid / sk_live hits yet.</Text>}

@@ -35,6 +35,22 @@ ADMIN_SDK_NAMES = {
     "Firebase_Admin_SDK_Email",
     "Google_Service_Account_Email",
 }
+DB_URL_NAMES = {
+    "PostgreSQL_URI",
+    "MySQL_URI",
+    "MongoDB_URI",
+    "Redis_URI",
+    "JDBC_URI",
+    "MSSQL_URI",
+    "AMQP_URI",
+    "CouchDB_URI",
+    "Elasticsearch_URL",
+    "Database_URL",
+    "Supabase_URL",
+    "AWS_RDS_Host",
+    "Azure_Cosmos_Host",
+    "DB_Password_Assignment",
+}
 
 # Finding categories that are almost always noise for "raw secret" export.
 NOISE_FINDING_NAMES = {
@@ -420,6 +436,28 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
             ):
                 _add(priority, str(hit["summary"]))
 
+    # Database URLs / connection strings → Priority when remote or credentialed.
+    try:
+        from db_url_detect import detect_db_urls  # local tools import
+    except ImportError:  # pragma: no cover
+        detect_db_urls = None  # type: ignore[assignment]
+    db_urls: list[dict[str, Any]] = []
+    if detect_db_urls is not None:
+        db_urls = detect_db_urls({
+            "findings": findings,
+            "apk": job.get("apk") or "",
+            "package": job.get("package") or "",
+            "raw_lines": [],
+            "priority_lines": [],
+            "other_lines": [],
+        })
+        for hit in db_urls:
+            if hit.get("severity") in ("critical", "high") and hit.get("summary"):
+                # Skip bare Firebase hosts here — Firebase card already covers them.
+                if hit.get("kind") == "firebase" and not hit.get("has_credentials"):
+                    continue
+                _add(priority, str(hit["summary"]))
+
     priority = [x for x in priority if keep_priority_line(x)]
     # Drop other lines whose raw value is noise, or that duplicate a priority value
     priority_values = set(priority)
@@ -431,10 +469,10 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
         if raw in priority_values or line in priority_values:
             continue
         # Avoid duplicating raw SA/private-key fragments already summarized.
-        if line.startswith("ADMIN_SDK:"):
+        if line.startswith("ADMIN_SDK:") or line.startswith("DB_URL:"):
             continue
         label = line.split(":", 1)[0].strip() if ":" in line else ""
-        if label in ADMIN_SDK_NAMES:
+        if label in ADMIN_SDK_NAMES or label in DB_URL_NAMES:
             continue
         if line not in cleaned_other:
             cleaned_other.append(line)
@@ -446,19 +484,21 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
         "other_lines": other,
         "aws_pairs": aws_pairs,
         "admin_sdk": admin_sdk,
+        "db_urls": db_urls,
         "sendgrid": [x for x in priority if x.startswith("SG.")],
         "sk_live": [x for x in priority if x.startswith("sk_live_") or x.startswith("rk_live_")],
         "raw_other": other,
         "finding_count": len(lines),
         "has_aws": bool(aws_pairs),
         "has_admin_sdk": any(h.get("severity") in ("critical", "high") for h in admin_sdk),
+        "has_db_urls": any(h.get("severity") in ("critical", "high") for h in db_urls),
     }
 
 
 def _is_priority_line(line: str) -> bool:
     if not line:
         return False
-    if line.startswith("ADMIN_SDK:"):
+    if line.startswith("ADMIN_SDK:") or line.startswith("DB_URL:"):
         return True
     if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
         return True
@@ -474,7 +514,7 @@ def keep_priority_line(line: str) -> bool:
     """Drop placeholder / letter-only AWS leftovers from Priority."""
     if not line:
         return False
-    if line.startswith("ADMIN_SDK:"):
+    if line.startswith("ADMIN_SDK:") or line.startswith("DB_URL:"):
         return True
     if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
         return not is_noise_value(line)

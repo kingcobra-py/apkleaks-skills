@@ -28,12 +28,14 @@ DOWNLOAD_STATUS_PATH = RESULTS_DIR / "download-status.json"
 LOOP_STATUS_PATH = RESULTS_DIR / "loop-status.json"
 FIREBASE_ACCESS_PATH = RESULTS_DIR / "firebase-access.json"
 ADMIN_SDK_ACCESS_PATH = RESULTS_DIR / "admin-sdk-access.json"
+DB_URLS_PATH = RESULTS_DIR / "db-urls.json"
 
 _STATE_LOCK = threading.RLock()
 _DOWNLOAD_PROC: subprocess.Popen | None = None
 _SCAN_PROC: subprocess.Popen | None = None
 _FIREBASE_PROC: subprocess.Popen | None = None
 _ADMIN_SDK_PROC: subprocess.Popen | None = None
+_DB_URLS_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
 _RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
 _SYSTEM_CACHE: dict = {"built_at": 0.0, "data": None}
@@ -47,6 +49,7 @@ _META_SKIP = {
     "loop-status.json",
     "firebase-access.json",
     "admin-sdk-access.json",
+    "db-urls.json",
 }
 
 
@@ -259,6 +262,7 @@ def system_stats(force: bool = False) -> dict:
         "loop": load_loop_status(),
         "firebase": load_firebase_access(),
         "admin_sdk": load_admin_sdk_access(),
+        "db_urls": load_db_urls(),
         "config": load_config(),
     }
     _SYSTEM_CACHE["data"] = data
@@ -278,6 +282,113 @@ def _utc_now() -> str:
 def _write_loop_status(payload: dict) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     LOOP_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_db_urls() -> dict:
+    default = {
+        "ok": True,
+        "total": 0,
+        "critical_count": 0,
+        "high_count": 0,
+        "with_credentials": 0,
+        "by_kind": {},
+        "critical": [],
+        "high": [],
+        "results": [],
+        "state": "idle",
+        "message": "No database URL scan yet",
+    }
+    if DB_URLS_PATH.is_file():
+        try:
+            data = json.loads(DB_URLS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                default.update(data)
+        except json.JSONDecodeError:
+            pass
+    with _STATE_LOCK:
+        running = _DB_URLS_PROC is not None and _DB_URLS_PROC.poll() is None
+    default["running"] = running
+    if running:
+        default["state"] = "running"
+        default["message"] = default.get("message") or "Scanning for database URLs…"
+    elif default.get("state") == "running":
+        default["state"] = "idle"
+    return default
+
+
+def start_db_urls_scan() -> dict:
+    """Re-scan all saved job JSONs for database URLs / connection strings."""
+    global _DB_URLS_PROC
+    with _STATE_LOCK:
+        if _DB_URLS_PROC is not None and _DB_URLS_PROC.poll() is None:
+            return {
+                "ok": False,
+                "error": "DB URL scan already running",
+                "error_code": "BUSY",
+                "db_urls": load_db_urls(),
+            }
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = ROOT / "logs" / "db_url_detect.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        DB_URLS_PATH.write_text(
+            json.dumps({
+                "ok": True,
+                "state": "running",
+                "running": True,
+                "total": 0,
+                "critical_count": 0,
+                "high_count": 0,
+                "results": [],
+                "message": "Scanning saved results for database URLs…",
+                "updated_at": _utc_now(),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        venv_python = ROOT / ".venv" / "bin" / "python3"
+        python = str(venv_python) if venv_python.is_file() else sys.executable
+        cmd = [
+            python,
+            str(TOOLS / "db_url_detect.py"),
+            "--results",
+            str(RESULTS_DIR),
+        ]
+        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+        _DB_URLS_PROC = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        proc = _DB_URLS_PROC
+
+    def _watch() -> None:
+        code = proc.wait()
+        data = load_db_urls()
+        data["running"] = False
+        data["state"] = "completed" if code == 0 else "failed"
+        data["exit_code"] = code
+        data["message"] = (
+            f"Scan done — {data.get('critical_count', 0)} critical / "
+            f"{data.get('high_count', 0)} high / {data.get('total', 0)} total"
+            if code == 0
+            else f"DB URL scan failed (exit {code})"
+        )
+        data["updated_at"] = _utc_now()
+        try:
+            DB_URLS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        _SYSTEM_CACHE["built_at"] = 0.0
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return {
+        "ok": True,
+        "state": "started",
+        "pid": proc.pid,
+        "db_urls": load_db_urls(),
+        "message": "Started database URL scan over saved results",
+    }
 
 
 def load_admin_sdk_access() -> dict:
@@ -1201,6 +1312,13 @@ def load_status(status_path: Path) -> dict:
                 else:
                     data.setdefault("admin_sdk", [])
                     data["admin_sdk_status"] = sa
+                dbu = load_db_urls()
+                if dbu.get("results") or dbu.get("total"):
+                    data["db_urls"] = dbu.get("results") or []
+                    data["db_urls_status"] = dbu
+                else:
+                    data.setdefault("db_urls", [])
+                    data["db_urls_status"] = dbu
                 data["counts"] = data.get("counts") or {}
                 data["counts"].setdefault(
                     "firebase_dumpable",
@@ -1209,6 +1327,10 @@ def load_status(status_path: Path) -> dict:
                 data["counts"].setdefault(
                     "admin_sdk",
                     int(sa.get("critical_count") or 0) + int(sa.get("high_count") or 0),
+                )
+                data["counts"].setdefault(
+                    "db_urls",
+                    int(dbu.get("critical_count") or 0) + int(dbu.get("high_count") or 0),
                 )
                 data["demo"] = False
                 return data
@@ -1398,6 +1520,10 @@ class StatusHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "admin_sdk": load_admin_sdk_access()})
             return
 
+        if path in ("/api/db-urls", "/api/db_urls", "/api/db-urls/status"):
+            self._json({"ok": True, "db_urls": load_db_urls()})
+            return
+
         site_prefix = "/apkleaks-skills"
         if path == site_prefix or path.startswith(site_prefix + "/"):
             rel = path[len(site_prefix) :] or "/"
@@ -1440,6 +1566,8 @@ class StatusHandler(BaseHTTPRequestHandler):
                     "/api/firebase/probe",
                     "/api/admin-sdk",
                     "/api/admin-sdk/scan",
+                    "/api/db-urls",
+                    "/api/db-urls/scan",
                     "/apkleaks-skills/dashboard",
                 ],
             },
@@ -1559,6 +1687,10 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/admin-sdk/scan", "/api/admin_sdk/scan", "/api/admin-sdk/probe"):
             self._json(start_admin_sdk_scan())
+            return
+
+        if path in ("/api/db-urls/scan", "/api/db_urls/scan", "/api/db-urls/probe"):
+            self._json(start_db_urls_scan())
             return
 
         if path == "/api/config":
