@@ -99,18 +99,18 @@ def detect_admin_sdk(job: dict[str, Any]) -> list[dict[str, Any]]:
     if not (has_sa_type or has_pem or emails or admin_emails):
         return []
 
-    # Confidence:
+    # Confidence (Admin SDK focused — plain SSH/RSA keys alone are NOT Admin SDK):
     # - critical: private key + (service_account type OR gsa email / firebase-adminsdk)
-    # - high: private key alone, or firebase-adminsdk email without key (still suspicious)
-    # - medium: service_account type string alone
+    # - high: firebase-adminsdk email, or service_account type + client_email (key may be nearby)
+    # - medium: service_account type alone, or gsa email alone, or PEM alone (needs review)
     if has_pem and (has_sa_type or emails or admin_emails):
         severity = "critical"
         kind = "admin_sdk_service_account"
         detail = "Service account JSON markers + private key PEM (likely Admin SDK / GCP SA leak)"
-    elif has_pem:
-        severity = "high"
-        kind = "private_key"
-        detail = "Private key PEM found (confirm if paired with service account JSON)"
+    elif admin_emails and has_pem:
+        severity = "critical"
+        kind = "firebase_adminsdk_full"
+        detail = "firebase-adminsdk email + private key PEM"
     elif admin_emails:
         severity = "high"
         kind = "firebase_adminsdk_email"
@@ -123,10 +123,17 @@ def detect_admin_sdk(job: dict[str, Any]) -> list[dict[str, Any]]:
         severity = "medium"
         kind = "service_account_type"
         detail = 'Only "type": "service_account" marker — verify full JSON / private_key'
-    else:
+    elif emails:
         severity = "medium"
         kind = "service_account_email"
         detail = "GCP service account email found without private key in same scan"
+    elif has_pem:
+        # Generic PEM (SSH/TLS/pinning) — not Admin SDK by itself.
+        severity = "medium"
+        kind = "private_key_only"
+        detail = "Private key PEM without service_account markers (likely not Admin SDK)"
+    else:
+        return []
 
     # Redacted summary line for Priority box — never dump full PEM.
     email_show = (admin_emails or emails or ["unknown-sa"])[0]

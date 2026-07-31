@@ -272,6 +272,22 @@ class AdminSdkDetectTests(unittest.TestCase):
         hits = admin_sdk_detect.detect_admin_sdk(job)
         self.assertEqual(hits[0]["severity"], "medium")
 
+    def test_pem_alone_is_medium_not_admin_sdk_priority(self):
+        job = {
+            "apk": "ssh.apk",
+            "findings": [
+                {
+                    "name": "Private_Key_Generic",
+                    "matches": ["-----BEGIN PRIVATE KEY-----"],
+                }
+            ],
+        }
+        hits = admin_sdk_detect.detect_admin_sdk(job)
+        self.assertEqual(hits[0]["severity"], "medium")
+        self.assertEqual(hits[0]["kind"], "private_key_only")
+        norm = normalize_job_findings(job)
+        self.assertFalse(any(x.startswith("ADMIN_SDK:") for x in norm["priority_lines"]))
+
     def test_normalize_puts_admin_sdk_in_priority(self):
         job = {
             "apk": "leak.apk",

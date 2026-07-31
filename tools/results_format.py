@@ -412,7 +412,12 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
             "other_lines": [],
         })
         for hit in admin_sdk:
-            if hit.get("severity") in ("critical", "high") and hit.get("summary"):
+            # Priority only for real Admin SDK / SA correlations — not bare PEMs.
+            if (
+                hit.get("severity") in ("critical", "high")
+                and hit.get("kind") != "private_key_only"
+                and hit.get("summary")
+            ):
                 _add(priority, str(hit["summary"]))
 
     priority = [x for x in priority if keep_priority_line(x)]
