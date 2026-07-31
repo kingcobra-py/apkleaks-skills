@@ -28,6 +28,7 @@ from fdroid_download import (  # noqa: E402
     select_packages,
 )
 import apk_download  # noqa: E402
+import firebase_probe  # noqa: E402
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
 
@@ -228,6 +229,49 @@ class ApkDownloadSourceTests(unittest.TestCase):
         })
         self.assertIn("com.demo.app", resolved["url"])
         self.assertEqual(resolved["apkName"], "com.demo.app_9.apk")
+
+
+class FirebaseProbeTests(unittest.TestCase):
+    def test_extract_hosts(self):
+        hosts = firebase_probe.extract_firebase_hosts(
+            "see millioner-ru.firebaseio.com and foo.firebasedatabase.app"
+        )
+        self.assertIn("millioner-ru.firebaseio.com", hosts)
+        self.assertIn("foo.firebasedatabase.app", hosts)
+        # Known public demo skipped
+        self.assertNotIn(
+            "hacker-news.firebaseio.com",
+            firebase_probe.extract_firebase_hosts("hacker-news.firebaseio.com"),
+        )
+
+    def test_classify_deactivated(self):
+        c = firebase_probe._classify(
+            200,
+            {"error": "The Firebase database 'x' has been deactivated."},
+            "",
+        )
+        self.assertEqual(c["status"], "deactivated")
+        self.assertFalse(c["dumpable"])
+
+    def test_classify_open(self):
+        c = firebase_probe._classify(200, {"users": True, "config": True}, "")
+        self.assertEqual(c["status"], "open")
+        self.assertTrue(c["dumpable"])
+        self.assertIn("users", c["shallow_keys"])
+
+    def test_hosts_from_job(self):
+        job = {
+            "apk": "demo.apk",
+            "findings": [
+                {"name": "Firebase", "matches": ["demo-app.firebaseio.com"]},
+                {"name": "Google_API_Key", "matches": ["AIzaSyD0iVxGQjimdgkthQfuu3wAdZkBOu8o0pI"]},
+            ],
+        }
+        self.assertEqual(firebase_probe.hosts_from_job(job), ["demo-app.firebaseio.com"])
+        self.assertEqual(
+            firebase_probe.api_keys_from_job(job),
+            ["AIzaSyD0iVxGQjimdgkthQfuu3wAdZkBOu8o0pI"],
+        )
 
 
 class ResultsFormatTests(unittest.TestCase):

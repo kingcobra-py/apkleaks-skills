@@ -34,6 +34,7 @@ try:
 except ImportError:  # pragma: no cover
     tqdm = None
 
+from firebase_probe import hosts_from_job, merge_firebase_results, probe_job  # noqa: E402
 from results_format import aggregate_results, normalize_job_findings  # noqa: E402
 
 
@@ -174,6 +175,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
             "has_aws": 0,
             "has_sendgrid": 0,
             "has_stripe": 0,
+            "firebase_dumpable": 0,
         },
         "current": [],
         "active": {},  # apk -> live phase info
@@ -183,6 +185,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
         "priority_lines": [],
         "other_lines": [],
         "aws_pairs": [],
+        "firebase_access": [],
     }
 
 
@@ -231,11 +234,13 @@ def _interesting_hits(findings: list[dict[str, Any]]) -> dict[str, bool]:
         ),
         "sendgrid": "SendGrid_API_Key" in names,
         "stripe": any(n.startswith("Stripe_") for n in names),
+        "firebase": "Firebase" in names,
     }
 
 
 def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
     """Keep status.json small — full findings stay in per-APK JSON files."""
+    firebase = job.get("firebase_access") or []
     return {
         "apk": job.get("apk"),
         "path": job.get("path"),
@@ -248,6 +253,8 @@ def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
         "priority_lines": job.get("priority_lines") or [],
         "other_lines": job.get("other_lines") or [],
         "aws_pairs": job.get("aws_pairs") or [],
+        "firebase_access": firebase,
+        "firebase_dumpable": sum(1 for r in firebase if r.get("dumpable")),
         "hits": job.get("hits") or {},
         "phase": job.get("phase") or ("done" if job.get("ok") else "failed"),
     }
@@ -477,7 +484,8 @@ def _scan_one(
             "priority_lines": [],
             "other_lines": [],
             "aws_pairs": [],
-            "hits": {"aws": False, "sendgrid": False, "stripe": False},
+            "firebase_access": [],
+            "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
             "phase": "failed",
         }
 
@@ -562,9 +570,32 @@ def _scan_one(
         findings = classified.get("results") or []
         hits = _interesting_hits(findings)
         norm = normalize_job_findings({"findings": findings})
+        firebase_access: list[dict[str, Any]] = []
+        probe_input = {
+            "apk": apk.name,
+            "package": classified.get("package") or "",
+            "findings": findings,
+            "raw_lines": norm["raw_lines"],
+            "other_lines": norm["other_lines"],
+            "priority_lines": norm["priority_lines"],
+        }
+        if hosts_from_job(probe_input):
+            phase("firebase", "Probing Firebase DB read access", 96)
+            try:
+                firebase_access = probe_job(probe_input)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("Firebase probe failed for %s: %s", apk.name, exc)
+                firebase_access = []
+            if any(r.get("dumpable") for r in firebase_access):
+                hits["firebase_dumpable"] = True
         duration_ms = int((time.time() - started) * 1000)
         error_code = "NO_FINDINGS" if classified.get("total_findings", 0) == 0 else None
-        phase("done", f"Done — {norm['finding_count']} secret(s)")
+        dumpable_n = sum(1 for r in firebase_access if r.get("dumpable"))
+        phase(
+            "done",
+            f"Done — {norm['finding_count']} secret(s)"
+            + (f", {dumpable_n} dumpable Firebase" if dumpable_n else ""),
+        )
         return {
             "apk": apk.name,
             "path": str(apk),
@@ -579,6 +610,7 @@ def _scan_one(
             "priority_lines": norm["priority_lines"],
             "other_lines": norm["other_lines"],
             "aws_pairs": norm["aws_pairs"],
+            "firebase_access": firebase_access,
             "hits": hits,
             "phase": "done",
             "package": classified.get("package") or "",
@@ -600,7 +632,8 @@ def _scan_one(
             "priority_lines": [],
             "other_lines": [],
             "aws_pairs": [],
-            "hits": {"aws": False, "sendgrid": False, "stripe": False},
+            "firebase_access": [],
+            "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
             "phase": "failed",
         }
     except Exception as exc:  # noqa: BLE001
@@ -620,7 +653,8 @@ def _scan_one(
             "priority_lines": [],
             "other_lines": [],
             "aws_pairs": [],
-            "hits": {"aws": False, "sendgrid": False, "stripe": False},
+            "firebase_access": [],
+            "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
             "phase": "failed",
         }
     finally:
@@ -706,6 +740,15 @@ def run_batch(
             status["aws_pairs"] = seeded.get("aws_pairs") or []
             status["counts"]["findings"] = len(status["raw_lines"])
             status["counts"]["has_aws"] = len(status["aws_pairs"])
+            fb_rows: list[dict[str, Any]] = []
+            for job in ordered_seed:
+                fb_rows.extend(job.get("firebase_access") or [])
+            if fb_rows:
+                merged_fb = merge_firebase_results(fb_rows)
+                status["firebase_access"] = merged_fb
+                status["counts"]["firebase_dumpable"] = sum(
+                    1 for r in merged_fb if r.get("dumpable")
+                )
     except Exception:  # noqa: BLE001
         pass
     status["queue_preview"] = [p.name for p in apks[:50]]
@@ -847,10 +890,18 @@ def run_batch(
             for pair in job.get("aws_pairs") or []:
                 if pair not in status["aws_pairs"]:
                     status["aws_pairs"].append(pair)
+            if job.get("firebase_access"):
+                merged = merge_firebase_results(
+                    list(status.get("firebase_access") or []) + list(job.get("firebase_access") or [])
+                )
+                status["firebase_access"] = merged
+                status["counts"]["firebase_dumpable"] = sum(1 for r in merged if r.get("dumpable"))
             level = "info" if job["ok"] else "error"
+            dumpable_n = sum(1 for r in (job.get("firebase_access") or []) if r.get("dumpable"))
             msg = (
                 f"Done {job['apk']}: findings={job.get('finding_count', 0)} "
                 f"ok={job['ok']} ({job.get('duration_ms', 0)} ms)"
+                + (f" firebase_dumpable={dumpable_n}" if dumpable_n else "")
             )
             _append_log(status, level, msg)
             LOG.log(logging.INFO if job["ok"] else logging.ERROR, msg)
@@ -896,7 +947,8 @@ def run_batch(
                 "priority_lines": [],
                 "other_lines": [],
                 "aws_pairs": [],
-                "hits": {"aws": False, "sendgrid": False, "stripe": False},
+                "firebase_access": [],
+                "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
                 "phase": "failed",
             }
 
@@ -936,7 +988,8 @@ def run_batch(
                         "priority_lines": [],
                         "other_lines": [],
                         "aws_pairs": [],
-                        "hits": {"aws": False, "sendgrid": False, "stripe": False},
+                        "firebase_access": [],
+                        "hits": {"aws": False, "sendgrid": False, "stripe": False, "firebase": False},
                         "phase": "failed",
                     }
                     set_phase(apk.name, "failed", str(exc)[:120])
@@ -1003,6 +1056,31 @@ def run_batch(
     status["priority_lines"] = agg.get("priority_lines") or []
     status["other_lines"] = agg.get("other_lines") or []
     status["aws_pairs"] = agg["aws_pairs"]
+    # Persist Firebase probe summary from per-APK results (already probed during scan).
+    try:
+        fb_rows: list[dict[str, Any]] = []
+        for _, job in disk_jobs:
+            fb_rows.extend(job.get("firebase_access") or [])
+        if not fb_rows:
+            for job in status.get("jobs") or []:
+                fb_rows.extend(job.get("firebase_access") or [])
+        if fb_rows:
+            merged_fb = merge_firebase_results(fb_rows)
+            status["firebase_access"] = merged_fb
+            status["counts"]["firebase_dumpable"] = sum(1 for r in merged_fb if r.get("dumpable"))
+            (output_dir / "firebase-access.json").write_text(
+                json.dumps({
+                    "ok": True,
+                    "probed": len(merged_fb),
+                    "dumpable_count": status["counts"]["firebase_dumpable"],
+                    "open": [r for r in merged_fb if r.get("status") == "open"],
+                    "results": merged_fb,
+                    "updated_at": _utc_now(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to write firebase-access.json: %s", exc)
     (output_dir / "results.txt").write_text(agg["text"], encoding="utf-8")
     (output_dir / "priority-results.txt").write_text(agg.get("priority_text") or "", encoding="utf-8")
     (output_dir / "other-results.txt").write_text(agg.get("other_text") or "", encoding="utf-8")

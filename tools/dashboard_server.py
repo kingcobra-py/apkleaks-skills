@@ -26,10 +26,12 @@ RESULTS_DIR = ROOT / "results"
 CONFIG_PATH = RESULTS_DIR / "dashboard-config.json"
 DOWNLOAD_STATUS_PATH = RESULTS_DIR / "download-status.json"
 LOOP_STATUS_PATH = RESULTS_DIR / "loop-status.json"
+FIREBASE_ACCESS_PATH = RESULTS_DIR / "firebase-access.json"
 
 _STATE_LOCK = threading.RLock()
 _DOWNLOAD_PROC: subprocess.Popen | None = None
 _SCAN_PROC: subprocess.Popen | None = None
+_FIREBASE_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
 _RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
 _SYSTEM_CACHE: dict = {"built_at": 0.0, "data": None}
@@ -41,6 +43,7 @@ _META_SKIP = {
     "dashboard-config.json",
     "download-status.json",
     "loop-status.json",
+    "firebase-access.json",
 }
 
 
@@ -251,6 +254,7 @@ def system_stats(force: bool = False) -> dict:
         "scan_running": scan_running,
         "loop_running": loop_running,
         "loop": load_loop_status(),
+        "firebase": load_firebase_access(),
         "config": load_config(),
     }
     _SYSTEM_CACHE["data"] = data
@@ -270,6 +274,115 @@ def _utc_now() -> str:
 def _write_loop_status(payload: dict) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     LOOP_STATUS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_firebase_access() -> dict:
+    default = {
+        "ok": True,
+        "probed": 0,
+        "dumpable_count": 0,
+        "open": [],
+        "denied": [],
+        "deactivated": [],
+        "other": [],
+        "results": [],
+        "state": "idle",
+        "message": "No Firebase probes yet",
+    }
+    if FIREBASE_ACCESS_PATH.is_file():
+        try:
+            data = json.loads(FIREBASE_ACCESS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                default.update(data)
+        except json.JSONDecodeError:
+            pass
+    with _STATE_LOCK:
+        running = _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None
+    default["running"] = running
+    if running:
+        default["state"] = "running"
+        default["message"] = default.get("message") or "Probing Firebase hosts…"
+    elif default.get("state") == "running":
+        default["state"] = "idle"
+    return default
+
+
+def start_firebase_probe(workers: int = 10) -> dict:
+    """Re-probe all Firebase hosts found in saved scan results."""
+    global _FIREBASE_PROC
+    workers_n = max(1, min(16, int(workers or 10)))
+    with _STATE_LOCK:
+        if _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None:
+            return {
+                "ok": False,
+                "error": "Firebase probe already running",
+                "error_code": "BUSY",
+                "firebase": load_firebase_access(),
+            }
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = ROOT / "logs" / "firebase_probe.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        FIREBASE_ACCESS_PATH.write_text(
+            json.dumps({
+                "ok": True,
+                "state": "running",
+                "running": True,
+                "probed": 0,
+                "dumpable_count": 0,
+                "results": [],
+                "open": [],
+                "message": "Probing Firebase hosts from scan results…",
+                "updated_at": _utc_now(),
+            }, indent=2),
+            encoding="utf-8",
+        )
+        venv_python = ROOT / ".venv" / "bin" / "python3"
+        python = str(venv_python) if venv_python.is_file() else sys.executable
+        cmd = [
+            python,
+            str(TOOLS / "firebase_probe.py"),
+            "--results",
+            str(RESULTS_DIR),
+            "-j",
+            str(workers_n),
+        ]
+        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+        _FIREBASE_PROC = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        proc = _FIREBASE_PROC
+
+    def _watch() -> None:
+        code = proc.wait()
+        data = load_firebase_access()
+        data["running"] = False
+        data["state"] = "completed" if code == 0 else "failed"
+        data["exit_code"] = code
+        data["message"] = (
+            f"Probe done — {data.get('dumpable_count', 0)} dumpable / {data.get('probed', 0)} probed"
+            if code == 0
+            else f"Probe failed (exit {code})"
+        )
+        data["updated_at"] = _utc_now()
+        try:
+            FIREBASE_ACCESS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        _SYSTEM_CACHE["built_at"] = 0.0
+
+    threading.Thread(target=_watch, daemon=True).start()
+    return {
+        "ok": True,
+        "state": "started",
+        "workers": workers_n,
+        "pid": proc.pid,
+        "firebase": load_firebase_access(),
+        "message": f"Started Firebase probe ({workers_n} workers) over saved scan results",
+    }
 
 
 def load_loop_status() -> dict:
@@ -964,7 +1077,19 @@ def load_status(status_path: Path) -> dict:
                 data.setdefault("other_lines", [])
                 data.setdefault("raw_lines", list(data.get("priority_lines") or []) + list(data.get("other_lines") or []))
                 data.setdefault("aws_pairs", [])
+                fb = load_firebase_access()
+                # Prefer live probe file; fall back to whatever status already has.
+                if fb.get("results") or fb.get("probed"):
+                    data["firebase_access"] = fb.get("results") or []
+                    data["firebase"] = fb
+                else:
+                    data.setdefault("firebase_access", [])
+                    data["firebase"] = fb
                 data["counts"] = data.get("counts") or {}
+                data["counts"].setdefault(
+                    "firebase_dumpable",
+                    int(fb.get("dumpable_count") or 0),
+                )
                 data["demo"] = False
                 return data
         except json.JSONDecodeError:
@@ -1145,6 +1270,10 @@ class StatusHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "state": "running" if running else "idle"})
             return
 
+        if path in ("/api/firebase", "/api/firebase/status"):
+            self._json({"ok": True, "firebase": load_firebase_access()})
+            return
+
         site_prefix = "/apkleaks-skills"
         if path == site_prefix or path.startswith(site_prefix + "/"):
             rel = path[len(site_prefix) :] or "/"
@@ -1183,6 +1312,8 @@ class StatusHandler(BaseHTTPRequestHandler):
                     "/api/threads",
                     "/api/loop",
                     "/api/loop/stop",
+                    "/api/firebase",
+                    "/api/firebase/probe",
                     "/apkleaks-skills/dashboard",
                 ],
             },
@@ -1285,6 +1416,19 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/loop/stop",):
             self._json(stop_loop())
+            return
+
+        if path in ("/api/firebase/probe", "/api/firebase/scan"):
+            workers = body.get("workers", 10)
+            try:
+                workers = int(workers)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "workers must be an integer"}, 400)
+                return
+            if workers < 1 or workers > 16:
+                self._json({"ok": False, "error": "workers must be 1..16"}, 400)
+                return
+            self._json(start_firebase_probe(workers=workers))
             return
 
         if path == "/api/config":

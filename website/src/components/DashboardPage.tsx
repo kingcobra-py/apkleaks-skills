@@ -73,6 +73,31 @@ type LoopStatus = {
   source?: string;
   message?: string;
 };
+type FirebaseAccessRow = {
+  host: string;
+  status: string;
+  dumpable?: boolean;
+  detail?: string;
+  shallow_keys?: string[];
+  empty?: boolean;
+  apk?: string;
+  package?: string;
+  probe_url?: string;
+  http_status?: number;
+};
+type FirebaseStatus = {
+  ok?: boolean;
+  running?: boolean;
+  state?: string;
+  message?: string;
+  probed?: number;
+  dumpable_count?: number;
+  open?: FirebaseAccessRow[];
+  denied?: FirebaseAccessRow[];
+  deactivated?: FirebaseAccessRow[];
+  results?: FirebaseAccessRow[];
+  updated_at?: string;
+};
 
 const DOWNLOAD_SOURCE_OPTIONS: { value: DownloadSource; label: string }[] = [
   { value: 'fdroid', label: 'F-Droid (open source)' },
@@ -98,6 +123,7 @@ type SystemStats = {
   scan_running?: boolean;
   loop_running?: boolean;
   loop?: LoopStatus;
+  firebase?: FirebaseStatus;
   config?: Config;
 };
 type ActiveApp = {
@@ -135,6 +161,8 @@ type Status = {
   priority_lines?: string[];
   other_lines?: string[];
   aws_pairs?: string[];
+  firebase_access?: FirebaseAccessRow[];
+  firebase?: FirebaseStatus;
   system?: SystemStats;
   config?: Config;
   loop?: LoopStatus;
@@ -147,6 +175,7 @@ const PHASE_COLOR: Record<string, string> = {
   decompiling: '#818cf8',
   scanning: '#f59e0b',
   classifying: '#a78bfa',
+  firebase: '#f97316',
   done: '#10b981',
   failed: '#ef4444',
 };
@@ -248,8 +277,10 @@ const DashboardPage: React.FC = () => {
   const [busyClear, setBusyClear] = useState(false);
   const [busyThreads, setBusyThreads] = useState(false);
   const [busyLoop, setBusyLoop] = useState(false);
+  const [busyFirebase, setBusyFirebase] = useState(false);
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
+  const [firebaseStatus, setFirebaseStatus] = useState<FirebaseStatus | null>(null);
   const sawLiveRef = useRef(false);
   const formSeededRef = useRef(false);
 
@@ -311,6 +342,19 @@ const DashboardPage: React.FC = () => {
     }
     if (nextPriority !== null) setPriorityLines(nextPriority);
     if (nextOther !== null) setOtherLines(nextOther);
+
+    const fb = data.firebase || data.system?.firebase;
+    if (fb) setFirebaseStatus(fb);
+    else if (Array.isArray(data.firebase_access)) {
+      const dumpable = data.firebase_access.filter((r) => r.dumpable);
+      setFirebaseStatus({
+        ok: true,
+        probed: data.firebase_access.length,
+        dumpable_count: dumpable.length,
+        open: dumpable,
+        results: data.firebase_access,
+      });
+    }
   }, [applyDemo, seedFormFromConfig]);
 
   useEffect(() => {
@@ -451,6 +495,27 @@ const DashboardPage: React.FC = () => {
     }
   };
 
+  const onProbeFirebase = async () => {
+    setBusyFirebase(true);
+    try {
+      const res = await apiFetch('/api/firebase/probe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workers: 10 }),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to start Firebase probe');
+      } else {
+        message.success(data.message || 'Firebase probe started');
+        if (data.firebase) setFirebaseStatus(data.firebase);
+      }
+      await refresh({ results: false });
+    } finally {
+      setBusyFirebase(false);
+    }
+  };
+
   const downloadText = (filename: string, text: string) => {
     const body = text.endsWith('\n') || !text ? text : `${text}\n`;
     const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
@@ -484,6 +549,12 @@ const DashboardPage: React.FC = () => {
   const mem = sys?.memory?.percent ?? 0;
   const loop = view.loop || sys?.loop;
   const loopRunning = Boolean(loop?.running || sys?.loop_running);
+  const firebase = firebaseStatus || view.firebase || sys?.firebase;
+  const firebaseRows = firebase?.results || view.firebase_access || [];
+  const firebaseDumpable = (firebase?.open && firebase.open.length
+    ? firebase.open
+    : firebaseRows.filter((r) => r.dumpable)) as FirebaseAccessRow[];
+  const firebaseRunning = Boolean(firebase?.running || firebase?.state === 'running');
   const activeApps = useMemo(() => {
     const map = view.active || {};
     const list = Object.values(map);
@@ -864,6 +935,108 @@ const DashboardPage: React.FC = () => {
                 {view.state === 'running' ? 'Waiting for the next APK worker…' : 'No apps scanning right now.'}
               </Text>
             )}
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <SecurityScanOutlined /> Firebase DB access
+                <Tag color={firebaseDumpable.length ? 'red' : 'default'}>
+                  dumpable: {firebase?.dumpable_count ?? firebaseDumpable.length}
+                </Tag>
+                <Tag>probed: {firebase?.probed ?? firebaseRows.length}</Tag>
+                {firebaseRunning ? <Tag color="processing">PROBING</Tag> : null}
+              </Space>
+            }
+            extra={
+              <Button
+                type="primary"
+                loading={busyFirebase || firebaseRunning}
+                icon={<SyncOutlined spin={firebaseRunning} />}
+                onClick={onProbeFirebase}
+              >
+                Probe all scanned Firebase hosts
+              </Button>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              Checks unauthenticated Realtime Database read access (<Text code>/.json?shallow=true</Text>).
+              New APK scans also probe Firebase hosts automatically. Only use on in-scope / bug-bounty targets.
+            </Paragraph>
+            {firebaseDumpable.length ? (
+              <Table
+                size="small"
+                pagination={{ pageSize: 8 }}
+                rowKey={(r) => r.host}
+                dataSource={firebaseDumpable}
+                columns={[
+                  {
+                    title: 'Host',
+                    dataIndex: 'host',
+                    render: (v: string) => <Text code>{v}</Text>,
+                  },
+                  {
+                    title: 'Status',
+                    dataIndex: 'status',
+                    width: 110,
+                    render: (v: string) => <Tag color="red">{v}</Tag>,
+                  },
+                  {
+                    title: 'Top keys',
+                    dataIndex: 'shallow_keys',
+                    render: (keys: string[] | undefined, row: FirebaseAccessRow) =>
+                      row.empty ? (
+                        <Text type="secondary">empty (still readable)</Text>
+                      ) : (
+                        <Text type="secondary">{(keys || []).slice(0, 8).join(', ') || '—'}</Text>
+                      ),
+                  },
+                  {
+                    title: 'APK',
+                    dataIndex: 'apk',
+                    render: (v: string) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : '—'),
+                  },
+                  {
+                    title: 'Dump URL',
+                    key: 'url',
+                    render: (_: unknown, row: FirebaseAccessRow) => (
+                      <Text copyable={{ text: `https://${row.host}/.json` }} style={{ fontSize: 12 }}>
+                        /.json
+                      </Text>
+                    ),
+                  },
+                ]}
+              />
+            ) : (
+              <Text type="secondary">
+                {firebaseRows.length
+                  ? `No dumpable open DBs yet (${firebaseRows.length} probed — denied/deactivated/errors).`
+                  : 'No Firebase hosts probed yet. Click “Probe all scanned Firebase hosts” to check existing results.'}
+              </Text>
+            )}
+            {firebaseRows.length && !firebaseDumpable.length ? (
+              <div style={{ marginTop: 12 }}>
+                <Text type="secondary">Recent probe statuses: </Text>
+                {['open', 'denied', 'deactivated', 'not_found', 'error'].map((st) => {
+                  const n = firebaseRows.filter((r) => r.status === st).length;
+                  return n ? (
+                    <Tag key={st} style={{ marginBottom: 4 }}>
+                      {st}: {n}
+                    </Tag>
+                  ) : null;
+                })}
+              </div>
+            ) : null}
+            {firebase?.message ? (
+              <div style={{ marginTop: 8 }}>
+                <Text type="secondary">{firebase.message}</Text>
+              </div>
+            ) : null}
           </Card>
         </Col>
       </Row>
