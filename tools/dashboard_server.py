@@ -1623,9 +1623,8 @@ class StatusHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "error": "threads must be an integer"}, 400)
                 return
-            if threads < 1 or threads > 12:
-                self._json({"ok": False, "error": "threads must be 1..12"}, 400)
-                return
+            # Clamp old UI values (e.g. 15) instead of hard-failing start.
+            threads = max(1, min(12, threads))
             restart = bool(body.get("restart", True))
             cfg = save_config({"threads": threads})
             if restart:
@@ -1654,12 +1653,9 @@ class StatusHandler(BaseHTTPRequestHandler):
             if apps < 1 or apps > 5000:
                 self._json({"ok": False, "error": "apps must be 1..5000"}, 400)
                 return
-            if threads < 1 or threads > 12:
-                self._json({"ok": False, "error": "threads must be 1..12"}, 400)
-                return
-            if workers < 1 or workers > 32:
-                self._json({"ok": False, "error": "download_workers must be 1..32"}, 400)
-                return
+            # Clamp — old UI/local state often still sends 15 after we lowered the cap.
+            threads = max(1, min(12, threads))
+            workers = max(1, min(32, workers))
             source_n = _normalize_download_source(source)
             if str(source or "").strip() and source_n != str(source).strip().lower():
                 self._json({

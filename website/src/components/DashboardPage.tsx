@@ -350,10 +350,10 @@ const DashboardPage: React.FC = () => {
     if (cfg?.download_count) setDownloadCount(cfg.download_count);
     if (cfg?.download_workers) setDownloadWorkers(cfg.download_workers);
     if (cfg?.download_source) setDownloadSource(normalizeDownloadSource(cfg.download_source));
-    if (cfg?.threads) setThreads(cfg.threads);
-    else if (threadsFallback) setThreads(threadsFallback);
+    if (cfg?.threads) setThreads(Math.min(12, Math.max(1, cfg.threads)));
+    else if (threadsFallback) setThreads(Math.min(12, Math.max(1, threadsFallback)));
     if (cfg?.loop_apps) setLoopApps(cfg.loop_apps);
-    if (cfg?.loop_threads) setLoopThreads(cfg.loop_threads);
+    if (cfg?.loop_threads) setLoopThreads(Math.min(12, Math.max(1, cfg.loop_threads)));
     if (cfg?.loop_download_workers) setLoopDownloadWorkers(cfg.loop_download_workers);
     else if (cfg?.download_workers) setLoopDownloadWorkers(cfg.download_workers);
   }, []);
@@ -550,14 +550,14 @@ const DashboardPage: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           apps: loopApps,
-          threads: loopThreads,
+          threads: Math.min(12, Math.max(1, loopThreads || 6)),
           download_workers: loopDownloadWorkers,
           source: downloadSource,
         }),
       });
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
-        message.error(data?.error || 'Failed to start loop');
+        message.error(data?.error || (res ? `Failed to start loop (HTTP ${res.status})` : 'Failed to start loop (no response)'));
       } else {
         message.success(data.message || 'Auto loop started');
       }
