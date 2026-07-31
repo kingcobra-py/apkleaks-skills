@@ -453,6 +453,47 @@ class FirebaseProbeTests(unittest.TestCase):
             ["AIzaSyD0iVxGQjimdgkthQfuu3wAdZkBOu8o0pI"],
         )
 
+    def test_extract_emails(self):
+        emails = firebase_probe.extract_emails(
+            '{"u":"Alice <alice@corp-mail.io>","x":"ignore@example.com","y":"bob.smith+tag@my-app.co.uk"}'
+        )
+        self.assertIn("alice@corp-mail.io", emails)
+        self.assertIn("bob.smith+tag@my-app.co.uk", emails)
+        self.assertNotIn("ignore@example.com", emails)
+
+    def test_merge_newest_first(self):
+        rows = [
+            {
+                "host": "old.firebaseio.com",
+                "status": "open",
+                "dumpable": True,
+                "probed_at": "2026-01-01T00:00:00Z",
+                "email_count": 1,
+            },
+            {
+                "host": "new.firebaseio.com",
+                "status": "denied",
+                "dumpable": False,
+                "probed_at": "2026-07-01T00:00:00Z",
+                "email_count": 0,
+            },
+            {
+                "host": "mid.firebaseio.com",
+                "status": "open",
+                "dumpable": True,
+                "probed_at": "2026-06-01T00:00:00Z",
+                "email_count": 5,
+            },
+        ]
+        merged = firebase_probe.merge_firebase_results(rows)
+        self.assertEqual(
+            [r["host"] for r in merged],
+            ["new.firebaseio.com", "mid.firebaseio.com", "old.firebaseio.com"],
+        )
+        summary = firebase_probe.build_firebase_summary(rows)
+        self.assertEqual(summary["email_count"], 6)
+        self.assertEqual(summary["dumpable_count"], 2)
+
 
 class ResultsFormatTests(unittest.TestCase):
     def test_aws_pair_format(self):

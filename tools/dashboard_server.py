@@ -20,6 +20,12 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from results_format import aggregate_results  # noqa: E402
+from firebase_probe import (  # noqa: E402
+    build_firebase_summary,
+    collect_hosts_from_results,
+    merge_firebase_results,
+    sort_newest_first,
+)
 
 APKS_DIR = ROOT / "apks"
 RESULTS_DIR = ROOT / "results"
@@ -43,6 +49,7 @@ _STATUS_CACHE: dict = {"built_at": 0.0, "data": None}
 _STATUS_CACHE_LOCK = threading.Lock()
 _LOOP_STOP = threading.Event()
 _LOOP_THREAD: threading.Thread | None = None
+_AUTO_FIREBASE_AT = 0.0
 _META_SKIP = {
     "status.json",
     "summary.json",
@@ -56,7 +63,7 @@ _META_SKIP = {
 
 # Polling endpoints must stay small — the UI aborts at a few seconds.
 _API_OTHER_LINES_CAP = 120
-_API_OPEN_CAP = 25
+_API_OPEN_CAP = 40
 _API_HIT_CAP = 25
 _API_LOG_CAP = 20
 _API_JOBS_CAP = 15
@@ -210,17 +217,33 @@ def _cap_list(items: list | None, limit: int) -> list:
 
 def summarize_firebase(data: dict) -> dict:
     """Compact Firebase payload for dashboard polls (full list via /api/firebase)."""
-    open_rows = data.get("open") or []
-    if not open_rows and data.get("results"):
-        open_rows = [r for r in data["results"] if isinstance(r, dict) and r.get("dumpable")]
+    results = [r for r in (data.get("results") or []) if isinstance(r, dict)]
+    results = sort_newest_first(results)
+    open_rows = [r for r in results if r.get("dumpable") or r.get("status") == "open"]
+    if not open_rows:
+        open_rows = [r for r in (data.get("open") or []) if isinstance(r, dict)]
+        open_rows = sort_newest_first(open_rows)
+    email_count = int(
+        data.get("email_count")
+        if data.get("email_count") is not None
+        else sum(int(r.get("email_count") or 0) for r in results)
+    )
+    # Prefer showing dumpable newest-first; fall back to all recent probes.
+    display = open_rows if open_rows else results
     return {
         "ok": data.get("ok", True),
-        "probed": int(data.get("probed") or 0),
+        "probed": int(data.get("probed") or len(results) or 0),
         "dumpable_count": int(data.get("dumpable_count") or len(open_rows) or 0),
+        "email_count": email_count,
+        "hosts_with_email": int(
+            data.get("hosts_with_email")
+            if data.get("hosts_with_email") is not None
+            else sum(1 for r in results if int(r.get("email_count") or 0) > 0)
+        ),
         "open": _cap_list(open_rows, _API_OPEN_CAP),
         "denied_count": len(data.get("denied") or []),
         "deactivated_count": len(data.get("deactivated") or []),
-        "results": _cap_list(open_rows, _API_OPEN_CAP),
+        "results": _cap_list(display, _API_OPEN_CAP),
         "state": data.get("state") or "idle",
         "message": data.get("message") or "",
         "running": bool(data.get("running")),
@@ -624,6 +647,8 @@ def load_firebase_access() -> dict:
         "ok": True,
         "probed": 0,
         "dumpable_count": 0,
+        "email_count": 0,
+        "hosts_with_email": 0,
         "open": [],
         "denied": [],
         "deactivated": [],
@@ -639,6 +664,19 @@ def load_firebase_access() -> dict:
                 default.update(data)
         except json.JSONDecodeError:
             pass
+    # Normalize ordering for consumers.
+    if isinstance(default.get("results"), list):
+        default["results"] = sort_newest_first(
+            [r for r in default["results"] if isinstance(r, dict)]
+        )
+    if isinstance(default.get("open"), list):
+        default["open"] = sort_newest_first(
+            [r for r in default["open"] if isinstance(r, dict)]
+        )
+    if default.get("email_count") is None:
+        default["email_count"] = sum(
+            int(r.get("email_count") or 0) for r in (default.get("results") or [])
+        )
     with _STATE_LOCK:
         running = _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None
     default["running"] = running
@@ -650,31 +688,83 @@ def load_firebase_access() -> dict:
     return default
 
 
-def start_firebase_probe(workers: int = 10) -> dict:
+def _firebase_needs_probe(existing: dict | None = None) -> bool:
+    """True when scan results have hosts that are missing / lack email scans."""
+    existing = existing or load_firebase_access()
+    triples = collect_hosts_from_results(RESULTS_DIR)
+    if not triples:
+        return False
+    probed_hosts = {
+        str(r.get("host") or "").lower()
+        for r in (existing.get("results") or [])
+        if isinstance(r, dict)
+    }
+    if any(h not in probed_hosts for h, _, _ in triples):
+        return True
+    # Re-scan open DBs that never got an email pass (legacy probe rows).
+    for row in existing.get("results") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("dumpable") and row.get("email_count") is None:
+            return True
+    return False
+
+
+def maybe_auto_firebase_probe(force: bool = False) -> dict | None:
+    """Auto-start Firebase probe when hosts exist and need checking (no UI click)."""
+    global _AUTO_FIREBASE_AT
+    now = time.time()
+    with _STATE_LOCK:
+        if _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None:
+            return None
+        if not force and (now - _AUTO_FIREBASE_AT) < 45.0:
+            return None
+        # Claim the throttle slot before disk work so status polls don't re-scan every 2s.
+        _AUTO_FIREBASE_AT = now
+    existing = load_firebase_access()
+    if not force and not _firebase_needs_probe(existing):
+        return None
+    result = start_firebase_probe(workers=10, preserve=True, silent=True)
+    return result if result.get("ok") else None
+
+
+def start_firebase_probe(
+    workers: int = 10,
+    preserve: bool = True,
+    silent: bool = False,
+) -> dict:
     """Re-probe all Firebase hosts found in saved scan results."""
     global _FIREBASE_PROC
     workers_n = max(1, min(16, int(workers or 10)))
     with _STATE_LOCK:
         if _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None:
             return {
-                "ok": False,
-                "error": "Firebase probe already running",
+                "ok": False if not silent else True,
+                "error": None if silent else "Firebase probe already running",
                 "error_code": "BUSY",
                 "firebase": load_firebase_access(),
+                "message": "Firebase probe already running",
             }
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         log_path = ROOT / "logs" / "firebase_probe.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        prev = load_firebase_access() if preserve else {}
         FIREBASE_ACCESS_PATH.write_text(
             json.dumps({
                 "ok": True,
                 "state": "running",
                 "running": True,
-                "probed": 0,
-                "dumpable_count": 0,
-                "results": [],
-                "open": [],
-                "message": "Probing Firebase hosts from scan results…",
+                "probed": int(prev.get("probed") or 0),
+                "dumpable_count": int(prev.get("dumpable_count") or 0),
+                "email_count": int(prev.get("email_count") or 0),
+                "hosts_with_email": int(prev.get("hosts_with_email") or 0),
+                "results": list(prev.get("results") or []) if preserve else [],
+                "open": list(prev.get("open") or []) if preserve else [],
+                "denied": list(prev.get("denied") or []) if preserve else [],
+                "deactivated": list(prev.get("deactivated") or []) if preserve else [],
+                "message": "Auto-probing Firebase hosts from scan results…"
+                if silent
+                else "Probing Firebase hosts from scan results…",
                 "updated_at": _utc_now(),
             }, indent=2),
             encoding="utf-8",
@@ -705,17 +795,29 @@ def start_firebase_probe(workers: int = 10) -> dict:
         data["running"] = False
         data["state"] = "completed" if code == 0 else "failed"
         data["exit_code"] = code
+        email_n = int(data.get("email_count") or 0)
         data["message"] = (
-            f"Probe done — {data.get('dumpable_count', 0)} dumpable / {data.get('probed', 0)} probed"
+            (
+                f"Probe done — {data.get('dumpable_count', 0)} dumpable / "
+                f"{data.get('probed', 0)} probed"
+                + (f" — {email_n} emails" if email_n else "")
+            )
             if code == 0
             else f"Probe failed (exit {code})"
         )
         data["updated_at"] = _utc_now()
         try:
-            FIREBASE_ACCESS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            # Re-normalize newest-first + email totals after probe script rewrite.
+            summary = build_firebase_summary(list(data.get("results") or []), message=data["message"])
+            summary["state"] = data["state"]
+            summary["running"] = False
+            summary["exit_code"] = code
+            FIREBASE_ACCESS_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         except OSError:
             pass
         _SYSTEM_CACHE["built_at"] = 0.0
+        with _STATUS_CACHE_LOCK:
+            _STATUS_CACHE["built_at"] = 0.0
 
     threading.Thread(target=_watch, daemon=True).start()
     return {
@@ -724,7 +826,10 @@ def start_firebase_probe(workers: int = 10) -> dict:
         "workers": workers_n,
         "pid": proc.pid,
         "firebase": load_firebase_access(),
-        "message": f"Started Firebase probe ({workers_n} workers) over saved scan results",
+        "message": (
+            f"{'Auto-started' if silent else 'Started'} Firebase probe "
+            f"({workers_n} workers) over saved scan results"
+        ),
     }
 
 
@@ -1436,20 +1541,41 @@ def load_status(status_path: Path) -> dict:
                 data["jobs"] = list(data.get("jobs") or [])[-_API_JOBS_CAP:]
                 data["queue_preview"] = list(data.get("queue_preview") or [])[:30]
 
-                fb = summarize_firebase(load_firebase_access())
+                # Auto-probe unscanned Firebase hosts (no UI click required).
+                try:
+                    maybe_auto_firebase_probe(force=False)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                file_fb = load_firebase_access()
+                live_fb_rows = [
+                    r for r in (data.get("firebase_access") or []) if isinstance(r, dict)
+                ]
+                if live_fb_rows:
+                    file_fb = build_firebase_summary(
+                        merge_firebase_results(
+                            list(file_fb.get("results") or []) + live_fb_rows
+                        ),
+                        message=file_fb.get("message") or "Live scan Firebase probes",
+                    )
+                    with _STATE_LOCK:
+                        running = _FIREBASE_PROC is not None and _FIREBASE_PROC.poll() is None
+                    file_fb["running"] = running or bool(file_fb.get("running"))
+                    if file_fb["running"]:
+                        file_fb["state"] = "running"
+
+                fb = summarize_firebase(file_fb)
                 sa = summarize_admin_sdk(load_admin_sdk_access())
                 dbu = summarize_db_urls(load_db_urls())
                 data["firebase"] = fb
-                data["firebase_access"] = list(fb.get("open") or [])
+                data["firebase_access"] = list(fb.get("results") or fb.get("open") or [])
                 data["admin_sdk_status"] = sa
                 data["admin_sdk"] = list(sa.get("results") or [])
                 data["db_urls_status"] = dbu
                 data["db_urls"] = list(dbu.get("results") or [])
                 data["counts"] = data.get("counts") or {}
-                data["counts"].setdefault(
-                    "firebase_dumpable",
-                    int(fb.get("dumpable_count") or 0),
-                )
+                data["counts"]["firebase_dumpable"] = int(fb.get("dumpable_count") or 0)
+                data["counts"]["firebase_emails"] = int(fb.get("email_count") or 0)
                 data["counts"].setdefault(
                     "admin_sdk",
                     int(sa.get("critical_count") or 0) + int(sa.get("high_count") or 0),
@@ -1840,6 +1966,7 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/firebase/probe", "/api/firebase/scan"):
             workers = body.get("workers", 10)
+            auto = bool(body.get("auto"))
             try:
                 workers = int(workers)
             except (TypeError, ValueError):
@@ -1848,7 +1975,20 @@ class StatusHandler(BaseHTTPRequestHandler):
             if workers < 1 or workers > 16:
                 self._json({"ok": False, "error": "workers must be 1..16"}, 400)
                 return
-            self._json(start_firebase_probe(workers=workers))
+            if auto:
+                # Silent auto mode: only probe when hosts need checking.
+                started = maybe_auto_firebase_probe(force=bool(body.get("force")))
+                if started is None:
+                    self._json({
+                        "ok": True,
+                        "state": "skipped",
+                        "firebase": load_firebase_access(),
+                        "message": "Firebase hosts already probed (or none found)",
+                    })
+                    return
+                self._json(started)
+                return
+            self._json(start_firebase_probe(workers=workers, preserve=True, silent=False))
             return
 
         if path in ("/api/admin-sdk/scan", "/api/admin_sdk/scan", "/api/admin-sdk/probe"):

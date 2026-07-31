@@ -37,7 +37,13 @@ except ImportError:  # pragma: no cover
 
 from admin_sdk_detect import detect_admin_sdk, merge_admin_sdk  # noqa: E402
 from db_url_detect import detect_db_urls, merge_db_urls  # noqa: E402
-from firebase_probe import hosts_from_job, merge_firebase_results, probe_job  # noqa: E402
+from firebase_probe import (  # noqa: E402
+    build_firebase_summary,
+    hosts_from_job,
+    merge_firebase_results,
+    probe_job,
+    write_firebase_summary,
+)
 from results_format import aggregate_results, normalize_job_findings  # noqa: E402
 
 
@@ -1192,6 +1198,7 @@ def run_batch(
         # large result files — that starved workers and left dozens of APKs
         # stuck as phase=done in the UI with no further progress.
         export_payload: dict[str, str] | None = None
+        firebase_snapshot: list[dict[str, Any]] | None = None
         with _STATUS_LOCK:
             name = job["apk"]
             if name in status["current"]:
@@ -1246,6 +1253,10 @@ def run_batch(
                 )
                 status["firebase_access"] = merged
                 status["counts"]["firebase_dumpable"] = sum(1 for r in merged if r.get("dumpable"))
+                status["counts"]["firebase_emails"] = sum(
+                    int(r.get("email_count") or 0) for r in merged
+                )
+                firebase_snapshot = list(merged)
             if job.get("admin_sdk"):
                 merged_sa = merge_admin_sdk(
                     list(status.get("admin_sdk") or []) + list(job.get("admin_sdk") or [])
@@ -1296,6 +1307,17 @@ def run_batch(
                 (out_dir / "other-results.txt").write_text(export_payload["other"], encoding="utf-8")
             except OSError as exc:
                 LOG.warning("Failed to write export txt files: %s", exc)
+
+        # Persist Firebase access live so the dashboard updates without a manual probe click.
+        if firebase_snapshot is not None:
+            try:
+                write_firebase_summary(
+                    output_dir,
+                    firebase_snapshot,
+                    message="Live — probed during APK scan (newest first)",
+                )
+            except OSError as exc:
+                LOG.warning("Failed to write firebase-access.json: %s", exc)
 
     def _worker(apk: Path) -> dict[str, Any]:
         mark_start(apk.name)
@@ -1432,18 +1454,15 @@ def run_batch(
             for job in status.get("jobs") or []:
                 fb_rows.extend(job.get("firebase_access") or [])
         if fb_rows:
-            merged_fb = merge_firebase_results(fb_rows)
-            status["firebase_access"] = merged_fb
-            status["counts"]["firebase_dumpable"] = sum(1 for r in merged_fb if r.get("dumpable"))
+            summary_fb = build_firebase_summary(
+                fb_rows,
+                message="Batch complete — Firebase hosts auto-probed (newest first)",
+            )
+            status["firebase_access"] = summary_fb["results"]
+            status["counts"]["firebase_dumpable"] = summary_fb["dumpable_count"]
+            status["counts"]["firebase_emails"] = int(summary_fb.get("email_count") or 0)
             (output_dir / "firebase-access.json").write_text(
-                json.dumps({
-                    "ok": True,
-                    "probed": len(merged_fb),
-                    "dumpable_count": status["counts"]["firebase_dumpable"],
-                    "open": [r for r in merged_fb if r.get("status") == "open"],
-                    "results": merged_fb,
-                    "updated_at": _utc_now(),
-                }, indent=2),
+                json.dumps(summary_fb, indent=2),
                 encoding="utf-8",
             )
     except Exception as exc:  # noqa: BLE001

@@ -84,6 +84,9 @@ type FirebaseAccessRow = {
   package?: string;
   probe_url?: string;
   http_status?: number;
+  probed_at?: string;
+  email_count?: number;
+  email_samples?: string[];
 };
 type FirebaseStatus = {
   ok?: boolean;
@@ -92,6 +95,8 @@ type FirebaseStatus = {
   message?: string;
   probed?: number;
   dumpable_count?: number;
+  email_count?: number;
+  hosts_with_email?: number;
   open?: FirebaseAccessRow[];
   denied?: FirebaseAccessRow[];
   deactivated?: FirebaseAccessRow[];
@@ -344,6 +349,7 @@ const DashboardPage: React.FC = () => {
   const [dbUrlsStatus, setDbUrlsStatus] = useState<DbUrlsStatus | null>(null);
   const sawLiveRef = useRef(false);
   const formSeededRef = useRef(false);
+  const autoFirebaseRef = useRef(false);
 
   const seedFormFromConfig = useCallback((cfg?: Config | null, threadsFallback?: number) => {
     if (!cfg && threadsFallback == null) return;
@@ -457,6 +463,14 @@ const DashboardPage: React.FC = () => {
       tickN += 1;
       // Full results merge every ~10s; status every 2s.
       await refresh({ results: tickN === 1 || tickN % 5 === 0 });
+      // Pull full Firebase list (newest first + email counts) periodically.
+      if (tickN === 1 || tickN % 3 === 0) {
+        const fbRes = await apiFetch('/api/firebase', undefined, 15000);
+        if (fbRes?.ok) {
+          const payload = await fbRes.json();
+          if (payload?.firebase) setFirebaseStatus(payload.firebase);
+        }
+      }
     };
     tick();
     const id = window.setInterval(tick, 2000);
@@ -465,6 +479,14 @@ const DashboardPage: React.FC = () => {
       window.clearInterval(id);
     };
   }, [refresh]);
+
+  // Auto-detect + probe Firebase URLs once after first live status (no click).
+  useEffect(() => {
+    if (source !== 'live' || autoFirebaseRef.current) return;
+    autoFirebaseRef.current = true;
+    void onProbeFirebase({ auto: true, quiet: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [source]);
 
   const view = status ?? DEMO;
 
@@ -595,24 +617,28 @@ const DashboardPage: React.FC = () => {
     }
   };
 
-  const onProbeFirebase = async () => {
-    setBusyFirebase(true);
+  const onProbeFirebase = async (opts?: { auto?: boolean; quiet?: boolean }) => {
+    const auto = Boolean(opts?.auto);
+    const quiet = Boolean(opts?.quiet);
+    if (!auto) setBusyFirebase(true);
     try {
       const res = await apiFetch('/api/firebase/probe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workers: 10 }),
+        body: JSON.stringify({ workers: 10, auto }),
       });
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
-        message.error(data?.error || 'Failed to start Firebase probe');
+        if (!quiet) message.error(data?.error || 'Failed to start Firebase probe');
       } else {
-        message.success(data.message || 'Firebase probe started');
+        if (!quiet && data.state !== 'skipped') {
+          message.success(data.message || 'Firebase probe started');
+        }
         if (data.firebase) setFirebaseStatus(data.firebase);
       }
-      await refresh({ results: false });
+      if (!quiet) await refresh({ results: false });
     } finally {
-      setBusyFirebase(false);
+      if (!auto) setBusyFirebase(false);
     }
   };
 
@@ -692,10 +718,28 @@ const DashboardPage: React.FC = () => {
   const loop = view.loop || sys?.loop;
   const loopRunning = Boolean(loop?.running || sys?.loop_running);
   const firebase = firebaseStatus || view.firebase || sys?.firebase;
-  const firebaseRows = firebase?.results || view.firebase_access || [];
-  const firebaseDumpable = (firebase?.open && firebase.open.length
-    ? firebase.open
-    : firebaseRows.filter((r) => r.dumpable)) as FirebaseAccessRow[];
+  const firebaseRows = useMemo(() => {
+    const rows = (firebase?.results || view.firebase_access || []) as FirebaseAccessRow[];
+    return [...rows].sort((a, b) => {
+      const ta = a.probed_at || '';
+      const tb = b.probed_at || '';
+      if (ta !== tb) return tb.localeCompare(ta);
+      return (b.email_count || 0) - (a.email_count || 0);
+    });
+  }, [firebase?.results, view.firebase_access]);
+  const firebaseDumpable = useMemo(() => {
+    const open = (firebase?.open || []) as FirebaseAccessRow[];
+    const base = open.length ? open : firebaseRows.filter((r) => r.dumpable);
+    return [...base].sort((a, b) => {
+      const ta = a.probed_at || '';
+      const tb = b.probed_at || '';
+      if (ta !== tb) return tb.localeCompare(ta);
+      return (b.email_count || 0) - (a.email_count || 0);
+    });
+  }, [firebase?.open, firebaseRows]);
+  const firebaseEmailTotal =
+    firebase?.email_count ??
+    firebaseRows.reduce((n, r) => n + (Number(r.email_count) || 0), 0);
   const firebaseRunning = Boolean(firebase?.running || firebase?.state === 'running');
   const adminSdk = adminSdkStatus || view.admin_sdk_status || sys?.admin_sdk;
   const adminSdkRows = (adminSdk && !Array.isArray(adminSdk) ? adminSdk.results : view.admin_sdk) || [];
@@ -1106,57 +1150,97 @@ const DashboardPage: React.FC = () => {
           <Card
             className="glass-card"
             title={
-              <Space>
+              <Space wrap>
                 <SecurityScanOutlined /> Firebase DB access
                 <Tag color={firebaseDumpable.length ? 'red' : 'default'}>
                   dumpable: {firebase?.dumpable_count ?? firebaseDumpable.length}
                 </Tag>
                 <Tag>probed: {firebase?.probed ?? firebaseRows.length}</Tag>
-                {firebaseRunning ? <Tag color="processing">PROBING</Tag> : null}
+                <Tag color={firebaseEmailTotal ? 'magenta' : 'default'}>
+                  emails: {firebaseEmailTotal}
+                </Tag>
+                {firebaseRunning ? <Tag color="processing">AUTO-PROBING</Tag> : null}
               </Space>
             }
             extra={
               <Button
-                type="primary"
                 loading={busyFirebase || firebaseRunning}
                 icon={<SyncOutlined spin={firebaseRunning} />}
-                onClick={onProbeFirebase}
+                onClick={() => onProbeFirebase()}
               >
-                Probe all scanned Firebase hosts
+                Re-probe
               </Button>
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              Checks unauthenticated Realtime Database read access (<Text code>/.json?shallow=true</Text>).
-              New APK scans also probe Firebase hosts automatically. Only use on in-scope / bug-bounty targets.
+              Auto-detects Firebase URLs from scans, probes unauthenticated read access, and counts emails in open dumps.
+              Results are newest first. Only use on in-scope / bug-bounty targets.
             </Paragraph>
-            {firebaseDumpable.length ? (
+            {firebaseRows.length ? (
               <Table
                 size="small"
-                pagination={{ pageSize: 8 }}
+                pagination={{ pageSize: 10 }}
                 rowKey={(r) => r.host}
-                dataSource={firebaseDumpable}
+                dataSource={firebaseRows}
                 columns={[
                   {
                     title: 'Host',
                     dataIndex: 'host',
-                    render: (v: string) => <Text code>{v}</Text>,
+                    render: (v: string, row: FirebaseAccessRow) => (
+                      <Space direction="vertical" size={0}>
+                        <Text code>{v}</Text>
+                        {row.probed_at ? (
+                          <Text type="secondary" style={{ fontSize: 11 }}>
+                            {row.probed_at}
+                          </Text>
+                        ) : null}
+                      </Space>
+                    ),
                   },
                   {
                     title: 'Status',
                     dataIndex: 'status',
                     width: 110,
-                    render: (v: string) => <Tag color="red">{v}</Tag>,
+                    render: (v: string, row: FirebaseAccessRow) => (
+                      <Tag color={row.dumpable ? 'red' : v === 'denied' ? 'default' : 'orange'}>
+                        {v}
+                      </Tag>
+                    ),
                   },
                   {
-                    title: 'Top keys',
-                    dataIndex: 'shallow_keys',
-                    render: (keys: string[] | undefined, row: FirebaseAccessRow) =>
-                      row.empty ? (
-                        <Text type="secondary">empty (still readable)</Text>
+                    title: 'Emails',
+                    dataIndex: 'email_count',
+                    width: 90,
+                    render: (n: number | undefined, row: FirebaseAccessRow) =>
+                      row.dumpable ? (
+                        <Tag color={n ? 'magenta' : 'default'}>{n ?? 0}</Tag>
                       ) : (
-                        <Text type="secondary">{(keys || []).slice(0, 8).join(', ') || '—'}</Text>
+                        <Text type="secondary">—</Text>
                       ),
+                  },
+                  {
+                    title: 'Top keys / samples',
+                    key: 'detail',
+                    render: (_: unknown, row: FirebaseAccessRow) => {
+                      if (!row.dumpable) {
+                        return <Text type="secondary">{row.detail || '—'}</Text>;
+                      }
+                      if (row.empty) {
+                        return <Text type="secondary">empty (still readable)</Text>;
+                      }
+                      const samples = (row.email_samples || []).slice(0, 3).join(', ');
+                      const keys = (row.shallow_keys || []).slice(0, 6).join(', ');
+                      return (
+                        <Space direction="vertical" size={0}>
+                          <Text type="secondary">{keys || '—'}</Text>
+                          {samples ? (
+                            <Text type="secondary" style={{ fontSize: 11 }}>
+                              e.g. {samples}
+                            </Text>
+                          ) : null}
+                        </Space>
+                      );
+                    },
                   },
                   {
                     title: 'APK',
@@ -1166,24 +1250,27 @@ const DashboardPage: React.FC = () => {
                   {
                     title: 'Dump URL',
                     key: 'url',
-                    render: (_: unknown, row: FirebaseAccessRow) => (
-                      <Text copyable={{ text: `https://${row.host}/.json` }} style={{ fontSize: 12 }}>
-                        /.json
-                      </Text>
-                    ),
+                    render: (_: unknown, row: FirebaseAccessRow) =>
+                      row.dumpable ? (
+                        <Text copyable={{ text: `https://${row.host}/.json` }} style={{ fontSize: 12 }}>
+                          /.json
+                        </Text>
+                      ) : (
+                        <Text type="secondary">—</Text>
+                      ),
                   },
                 ]}
               />
             ) : (
               <Text type="secondary">
-                {firebaseRows.length
-                  ? `No dumpable open DBs yet (${firebaseRows.length} probed — denied/deactivated/errors).`
-                  : 'No Firebase hosts probed yet. Click “Probe all scanned Firebase hosts” to check existing results.'}
+                {firebaseRunning
+                  ? 'Auto-probing Firebase hosts from scan results…'
+                  : 'No Firebase hosts found yet — new scans detect and probe URLs automatically.'}
               </Text>
             )}
-            {firebaseRows.length && !firebaseDumpable.length ? (
+            {firebaseRows.length ? (
               <div style={{ marginTop: 12 }}>
-                <Text type="secondary">Recent probe statuses: </Text>
+                <Text type="secondary">Statuses: </Text>
                 {['open', 'denied', 'deactivated', 'not_found', 'error'].map((st) => {
                   const n = firebaseRows.filter((r) => r.status === st).length;
                   return n ? (
@@ -1192,6 +1279,9 @@ const DashboardPage: React.FC = () => {
                     </Tag>
                   ) : null;
                 })}
+                <Tag color={firebaseEmailTotal ? 'magenta' : 'default'} style={{ marginBottom: 4 }}>
+                  emails total: {firebaseEmailTotal}
+                </Tag>
               </div>
             ) : null}
             {firebase?.message ? (

