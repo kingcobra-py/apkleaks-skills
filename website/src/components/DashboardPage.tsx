@@ -98,6 +98,32 @@ type FirebaseStatus = {
   results?: FirebaseAccessRow[];
   updated_at?: string;
 };
+type AdminSdkRow = {
+  kind: string;
+  severity: string;
+  summary: string;
+  detail?: string;
+  has_private_key?: boolean;
+  has_service_account_type?: boolean;
+  client_emails?: string[];
+  firebase_adminsdk_emails?: string[];
+  project_ids?: string[];
+  apk?: string;
+  package?: string;
+};
+type AdminSdkStatus = {
+  ok?: boolean;
+  running?: boolean;
+  state?: string;
+  message?: string;
+  total?: number;
+  critical_count?: number;
+  high_count?: number;
+  critical?: AdminSdkRow[];
+  high?: AdminSdkRow[];
+  results?: AdminSdkRow[];
+  updated_at?: string;
+};
 
 const DOWNLOAD_SOURCE_OPTIONS: { value: DownloadSource; label: string }[] = [
   { value: 'fdroid', label: 'F-Droid (open source)' },
@@ -124,6 +150,7 @@ type SystemStats = {
   loop_running?: boolean;
   loop?: LoopStatus;
   firebase?: FirebaseStatus;
+  admin_sdk?: AdminSdkStatus;
   config?: Config;
 };
 type ActiveApp = {
@@ -163,6 +190,8 @@ type Status = {
   aws_pairs?: string[];
   firebase_access?: FirebaseAccessRow[];
   firebase?: FirebaseStatus;
+  admin_sdk?: AdminSdkRow[];
+  admin_sdk_status?: AdminSdkStatus;
   system?: SystemStats;
   config?: Config;
   loop?: LoopStatus;
@@ -278,9 +307,11 @@ const DashboardPage: React.FC = () => {
   const [busyThreads, setBusyThreads] = useState(false);
   const [busyLoop, setBusyLoop] = useState(false);
   const [busyFirebase, setBusyFirebase] = useState(false);
+  const [busyAdminSdk, setBusyAdminSdk] = useState(false);
   const [priorityLines, setPriorityLines] = useState<string[]>([]);
   const [otherLines, setOtherLines] = useState<string[]>([]);
   const [firebaseStatus, setFirebaseStatus] = useState<FirebaseStatus | null>(null);
+  const [adminSdkStatus, setAdminSdkStatus] = useState<AdminSdkStatus | null>(null);
   const sawLiveRef = useRef(false);
   const formSeededRef = useRef(false);
 
@@ -353,6 +384,21 @@ const DashboardPage: React.FC = () => {
         dumpable_count: dumpable.length,
         open: dumpable,
         results: data.firebase_access,
+      });
+    }
+    const sa = data.admin_sdk_status || data.system?.admin_sdk;
+    if (sa && !Array.isArray(sa)) setAdminSdkStatus(sa);
+    else if (Array.isArray(data.admin_sdk)) {
+      const critical = data.admin_sdk.filter((r) => r.severity === 'critical');
+      const high = data.admin_sdk.filter((r) => r.severity === 'high');
+      setAdminSdkStatus({
+        ok: true,
+        total: data.admin_sdk.length,
+        critical_count: critical.length,
+        high_count: high.length,
+        critical,
+        high,
+        results: data.admin_sdk,
       });
     }
   }, [applyDemo, seedFormFromConfig]);
@@ -516,6 +562,27 @@ const DashboardPage: React.FC = () => {
     }
   };
 
+  const onScanAdminSdk = async () => {
+    setBusyAdminSdk(true);
+    try {
+      const res = await apiFetch('/api/admin-sdk/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = res ? await res.json() : null;
+      if (!res || !data?.ok) {
+        message.error(data?.error || 'Failed to start Admin SDK scan');
+      } else {
+        message.success(data.message || 'Admin SDK scan started');
+        if (data.admin_sdk) setAdminSdkStatus(data.admin_sdk);
+      }
+      await refresh({ results: false });
+    } finally {
+      setBusyAdminSdk(false);
+    }
+  };
+
   const downloadText = (filename: string, text: string) => {
     const body = text.endsWith('\n') || !text ? text : `${text}\n`;
     const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
@@ -555,6 +622,12 @@ const DashboardPage: React.FC = () => {
     ? firebase.open
     : firebaseRows.filter((r) => r.dumpable)) as FirebaseAccessRow[];
   const firebaseRunning = Boolean(firebase?.running || firebase?.state === 'running');
+  const adminSdk = adminSdkStatus || view.admin_sdk_status || sys?.admin_sdk;
+  const adminSdkRows = (adminSdk && !Array.isArray(adminSdk) ? adminSdk.results : view.admin_sdk) || [];
+  const adminSdkHot = adminSdkRows.filter((r) => r.severity === 'critical' || r.severity === 'high');
+  const adminSdkRunning = Boolean(
+    adminSdk && !Array.isArray(adminSdk) && (adminSdk.running || adminSdk.state === 'running'),
+  );
   const activeApps = useMemo(() => {
     const map = view.active || {};
     const list = Object.values(map);
@@ -1042,6 +1115,94 @@ const DashboardPage: React.FC = () => {
       </Row>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
+        <Col xs={24}>
+          <Card
+            className="glass-card"
+            title={
+              <Space>
+                <SecurityScanOutlined /> Admin SDK / service account
+                <Tag color={adminSdkHot.length ? 'red' : 'default'}>
+                  critical/high:{' '}
+                  {!Array.isArray(adminSdk)
+                    ? (adminSdk?.critical_count || 0) + (adminSdk?.high_count || 0)
+                    : adminSdkHot.length}
+                </Tag>
+                <Tag>total: {!Array.isArray(adminSdk) ? adminSdk?.total ?? adminSdkRows.length : adminSdkRows.length}</Tag>
+                {adminSdkRunning ? <Tag color="processing">SCANNING</Tag> : null}
+              </Space>
+            }
+            extra={
+              <Button
+                type="primary"
+                danger={adminSdkHot.length > 0}
+                loading={busyAdminSdk || adminSdkRunning}
+                icon={<SyncOutlined spin={adminSdkRunning} />}
+                onClick={onScanAdminSdk}
+              >
+                Scan results for Admin SDK
+              </Button>
+            }
+          >
+            <Paragraph type="secondary" style={{ marginTop: 0 }}>
+              Flags GCP/Firebase Admin credentials: <Text code>service_account</Text> +{' '}
+              <Text code>BEGIN PRIVATE KEY</Text>, <Text code>firebase-adminsdk@…</Text>, and related emails.
+              Full PEMs are never shown — only redacted summaries.
+            </Paragraph>
+            {adminSdkHot.length ? (
+              <Table
+                size="small"
+                pagination={{ pageSize: 8 }}
+                rowKey={(r) => `${r.apk}-${r.summary}`}
+                dataSource={adminSdkHot}
+                columns={[
+                  {
+                    title: 'Severity',
+                    dataIndex: 'severity',
+                    width: 100,
+                    render: (v: string) => (
+                      <Tag color={v === 'critical' ? 'red' : 'orange'}>{v}</Tag>
+                    ),
+                  },
+                  {
+                    title: 'Summary',
+                    dataIndex: 'summary',
+                    render: (v: string) => <Text code style={{ fontSize: 12 }}>{v}</Text>,
+                  },
+                  {
+                    title: 'Detail',
+                    dataIndex: 'detail',
+                    render: (v: string) => <Text type="secondary">{v || '—'}</Text>,
+                  },
+                  {
+                    title: 'APK',
+                    dataIndex: 'apk',
+                    render: (v: string) => (v ? <Text code style={{ fontSize: 12 }}>{v}</Text> : '—'),
+                  },
+                  {
+                    title: 'Key?',
+                    dataIndex: 'has_private_key',
+                    width: 70,
+                    render: (v: boolean) => (v ? <Tag color="red">PEM</Tag> : <Tag>no</Tag>),
+                  },
+                ]}
+              />
+            ) : (
+              <Text type="secondary">
+                {adminSdkRows.length
+                  ? `No critical/high Admin SDK hits (${adminSdkRows.length} medium/other markers).`
+                  : 'No Admin SDK leaks found yet. Click “Scan results for Admin SDK” to check existing scans.'}
+              </Text>
+            )}
+            {!Array.isArray(adminSdk) && adminSdk?.message ? (
+              <div style={{ marginTop: 8 }}>
+                <Text type="secondary">{adminSdk.message}</Text>
+              </div>
+            ) : null}
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} lg={12}>
           <Card
             className="glass-card"
@@ -1058,8 +1219,8 @@ const DashboardPage: React.FC = () => {
             }
           >
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-              Only AWS <Text code>Key:Secret</Text>, SendGrid (<Text code>SG.</Text>), and Stripe{' '}
-              <Text code>sk_live_</Text>. Job “Secrets” can be higher when hits are Other-only.
+              AWS <Text code>Key:Secret</Text>, SendGrid (<Text code>SG.</Text>), Stripe{' '}
+              <Text code>sk_live_</Text>, and <Text code>ADMIN_SDK:…</Text> service-account leaks.
             </Paragraph>
             <div style={monoBoxStyle}>
               {priorityLines.length ? priorityLines.join('\n') : <Text type="secondary">No AWS / SendGrid / sk_live hits yet.</Text>}

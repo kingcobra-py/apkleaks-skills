@@ -26,6 +26,15 @@ STRIPE_LIVE_NAMES = {
     "Picatic_API_Key",
     "Stripe_Restricted_API_Key",
 }
+ADMIN_SDK_NAMES = {
+    "Google_Cloud_Platform_Service_Account",
+    "RSA_Private_Key",
+    "SSH_DSA_Private_Key",
+    "SSH_EC_Private_Key",
+    "Private_Key_Generic",
+    "Firebase_Admin_SDK_Email",
+    "Google_Service_Account_Email",
+}
 
 # Finding categories that are almost always noise for "raw secret" export.
 NOISE_FINDING_NAMES = {
@@ -387,6 +396,25 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
         for secret in aws_secrets:
             _add(priority, secret)
 
+    # Correlated Admin SDK / GCP service-account leaks → Priority.
+    try:
+        from admin_sdk_detect import detect_admin_sdk  # local tools import
+    except ImportError:  # pragma: no cover
+        detect_admin_sdk = None  # type: ignore[assignment]
+    admin_sdk: list[dict[str, Any]] = []
+    if detect_admin_sdk is not None:
+        admin_sdk = detect_admin_sdk({
+            "findings": findings,
+            "apk": job.get("apk") or "",
+            "package": job.get("package") or "",
+            "raw_lines": [],
+            "priority_lines": [],
+            "other_lines": [],
+        })
+        for hit in admin_sdk:
+            if hit.get("severity") in ("critical", "high") and hit.get("summary"):
+                _add(priority, str(hit["summary"]))
+
     priority = [x for x in priority if keep_priority_line(x)]
     # Drop other lines whose raw value is noise, or that duplicate a priority value
     priority_values = set(priority)
@@ -397,6 +425,12 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
             continue
         if raw in priority_values or line in priority_values:
             continue
+        # Avoid duplicating raw SA/private-key fragments already summarized.
+        if line.startswith("ADMIN_SDK:"):
+            continue
+        label = line.split(":", 1)[0].strip() if ":" in line else ""
+        if label in ADMIN_SDK_NAMES:
+            continue
         if line not in cleaned_other:
             cleaned_other.append(line)
     other = cleaned_other
@@ -406,17 +440,21 @@ def normalize_job_findings(job: dict[str, Any]) -> dict[str, Any]:
         "priority_lines": priority,
         "other_lines": other,
         "aws_pairs": aws_pairs,
+        "admin_sdk": admin_sdk,
         "sendgrid": [x for x in priority if x.startswith("SG.")],
         "sk_live": [x for x in priority if x.startswith("sk_live_") or x.startswith("rk_live_")],
         "raw_other": other,
         "finding_count": len(lines),
         "has_aws": bool(aws_pairs),
+        "has_admin_sdk": any(h.get("severity") in ("critical", "high") for h in admin_sdk),
     }
 
 
 def _is_priority_line(line: str) -> bool:
     if not line:
         return False
+    if line.startswith("ADMIN_SDK:"):
+        return True
     if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
         return True
     if ":" in line and _AKIA_RE.search(line):
@@ -431,6 +469,8 @@ def keep_priority_line(line: str) -> bool:
     """Drop placeholder / letter-only AWS leftovers from Priority."""
     if not line:
         return False
+    if line.startswith("ADMIN_SDK:"):
+        return True
     if line.startswith("SG.") or line.startswith("sk_live_") or line.startswith("rk_live_"):
         return not is_noise_value(line)
     if ":" in line and _AKIA_RE.search(line.split(":", 1)[0]):

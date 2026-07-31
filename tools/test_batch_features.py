@@ -28,6 +28,7 @@ from fdroid_download import (  # noqa: E402
     select_packages,
 )
 import apk_download  # noqa: E402
+import admin_sdk_detect  # noqa: E402
 import firebase_probe  # noqa: E402
 from results_format import normalize_job_findings, aggregate_results  # noqa: E402
 
@@ -229,6 +230,69 @@ class ApkDownloadSourceTests(unittest.TestCase):
         })
         self.assertIn("com.demo.app", resolved["url"])
         self.assertEqual(resolved["apkName"], "com.demo.app_9.apk")
+
+
+class AdminSdkDetectTests(unittest.TestCase):
+    def test_critical_sa_plus_pem(self):
+        job = {
+            "apk": "leak.apk",
+            "findings": [
+                {
+                    "name": "Google_Cloud_Platform_Service_Account",
+                    "matches": ['"type": "service_account"'],
+                },
+                {
+                    "name": "Private_Key_Generic",
+                    "matches": ["-----BEGIN PRIVATE KEY-----"],
+                },
+                {
+                    "name": "Firebase_Admin_SDK_Email",
+                    "matches": [
+                        "firebase-adminsdk-abc12@demo-project.iam.gserviceaccount.com"
+                    ],
+                },
+            ],
+        }
+        hits = admin_sdk_detect.detect_admin_sdk(job)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "critical")
+        self.assertTrue(hits[0]["has_private_key"])
+        self.assertIn("ADMIN_SDK:critical:", hits[0]["summary"])
+
+    def test_medium_type_only(self):
+        job = {
+            "apk": "weak.apk",
+            "findings": [
+                {
+                    "name": "Google_Cloud_Platform_Service_Account",
+                    "matches": ['"type": "service_account"'],
+                }
+            ],
+        }
+        hits = admin_sdk_detect.detect_admin_sdk(job)
+        self.assertEqual(hits[0]["severity"], "medium")
+
+    def test_normalize_puts_admin_sdk_in_priority(self):
+        job = {
+            "apk": "leak.apk",
+            "findings": [
+                {
+                    "name": "Google_Cloud_Platform_Service_Account",
+                    "matches": ['"type": "service_account"'],
+                },
+                {
+                    "name": "Private_Key_Generic",
+                    "matches": ["-----BEGIN PRIVATE KEY-----"],
+                },
+                {
+                    "name": "Google_Service_Account_Email",
+                    "matches": ["runner@demo-project.iam.gserviceaccount.com"],
+                },
+            ],
+        }
+        norm = normalize_job_findings(job)
+        self.assertTrue(any(x.startswith("ADMIN_SDK:") for x in norm["priority_lines"]))
+        self.assertTrue(norm.get("has_admin_sdk"))
 
 
 class FirebaseProbeTests(unittest.TestCase):

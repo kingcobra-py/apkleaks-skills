@@ -34,6 +34,7 @@ try:
 except ImportError:  # pragma: no cover
     tqdm = None
 
+from admin_sdk_detect import detect_admin_sdk, merge_admin_sdk  # noqa: E402
 from firebase_probe import hosts_from_job, merge_firebase_results, probe_job  # noqa: E402
 from results_format import aggregate_results, normalize_job_findings  # noqa: E402
 
@@ -176,6 +177,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
             "has_sendgrid": 0,
             "has_stripe": 0,
             "firebase_dumpable": 0,
+            "admin_sdk": 0,
         },
         "current": [],
         "active": {},  # apk -> live phase info
@@ -186,6 +188,7 @@ def _empty_status(total: int, threads: int, input_dir: str, output_dir: str) -> 
         "other_lines": [],
         "aws_pairs": [],
         "firebase_access": [],
+        "admin_sdk": [],
     }
 
 
@@ -255,6 +258,7 @@ def _slim_job(job: dict[str, Any]) -> dict[str, Any]:
         "aws_pairs": job.get("aws_pairs") or [],
         "firebase_access": firebase,
         "firebase_dumpable": sum(1 for r in firebase if r.get("dumpable")),
+        "admin_sdk": job.get("admin_sdk") or [],
         "hits": job.get("hits") or {},
         "phase": job.get("phase") or ("done" if job.get("ok") else "failed"),
     }
@@ -569,7 +573,27 @@ def _scan_one(
         classified["package"] = raw_results.get("package", "")
         findings = classified.get("results") or []
         hits = _interesting_hits(findings)
-        norm = normalize_job_findings({"findings": findings})
+        norm = normalize_job_findings({
+            "findings": findings,
+            "apk": apk.name,
+            "package": classified.get("package") or "",
+        })
+        admin_sdk = list(norm.get("admin_sdk") or [])
+        if not admin_sdk:
+            try:
+                admin_sdk = detect_admin_sdk({
+                    "apk": apk.name,
+                    "package": classified.get("package") or "",
+                    "findings": findings,
+                    "raw_lines": norm["raw_lines"],
+                    "priority_lines": norm["priority_lines"],
+                    "other_lines": norm["other_lines"],
+                })
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("Admin SDK detect failed for %s: %s", apk.name, exc)
+                admin_sdk = []
+        if any(h.get("severity") in ("critical", "high") for h in admin_sdk):
+            hits["admin_sdk"] = True
         firebase_access: list[dict[str, Any]] = []
         probe_input = {
             "apk": apk.name,
@@ -591,10 +615,12 @@ def _scan_one(
         duration_ms = int((time.time() - started) * 1000)
         error_code = "NO_FINDINGS" if classified.get("total_findings", 0) == 0 else None
         dumpable_n = sum(1 for r in firebase_access if r.get("dumpable"))
+        admin_n = sum(1 for h in admin_sdk if h.get("severity") in ("critical", "high"))
         phase(
             "done",
             f"Done — {norm['finding_count']} secret(s)"
-            + (f", {dumpable_n} dumpable Firebase" if dumpable_n else ""),
+            + (f", {dumpable_n} dumpable Firebase" if dumpable_n else "")
+            + (f", {admin_n} Admin SDK" if admin_n else ""),
         )
         return {
             "apk": apk.name,
@@ -610,6 +636,7 @@ def _scan_one(
             "priority_lines": norm["priority_lines"],
             "other_lines": norm["other_lines"],
             "aws_pairs": norm["aws_pairs"],
+            "admin_sdk": admin_sdk,
             "firebase_access": firebase_access,
             "hits": hits,
             "phase": "done",
@@ -748,6 +775,22 @@ def run_batch(
                 status["firebase_access"] = merged_fb
                 status["counts"]["firebase_dumpable"] = sum(
                     1 for r in merged_fb if r.get("dumpable")
+                )
+            sa_rows: list[dict[str, Any]] = []
+            for job in ordered_seed:
+                existing = job.get("admin_sdk") or []
+                if existing:
+                    sa_rows.extend(existing)
+                else:
+                    try:
+                        sa_rows.extend(detect_admin_sdk(job))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if sa_rows:
+                merged_sa = merge_admin_sdk(sa_rows)
+                status["admin_sdk"] = merged_sa
+                status["counts"]["admin_sdk"] = sum(
+                    1 for r in merged_sa if r.get("severity") in ("critical", "high")
                 )
     except Exception:  # noqa: BLE001
         pass
@@ -896,12 +939,24 @@ def run_batch(
                 )
                 status["firebase_access"] = merged
                 status["counts"]["firebase_dumpable"] = sum(1 for r in merged if r.get("dumpable"))
+            if job.get("admin_sdk"):
+                merged_sa = merge_admin_sdk(
+                    list(status.get("admin_sdk") or []) + list(job.get("admin_sdk") or [])
+                )
+                status["admin_sdk"] = merged_sa
+                status["counts"]["admin_sdk"] = sum(
+                    1 for r in merged_sa if r.get("severity") in ("critical", "high")
+                )
             level = "info" if job["ok"] else "error"
             dumpable_n = sum(1 for r in (job.get("firebase_access") or []) if r.get("dumpable"))
+            admin_n = sum(
+                1 for r in (job.get("admin_sdk") or []) if r.get("severity") in ("critical", "high")
+            )
             msg = (
                 f"Done {job['apk']}: findings={job.get('finding_count', 0)} "
                 f"ok={job['ok']} ({job.get('duration_ms', 0)} ms)"
                 + (f" firebase_dumpable={dumpable_n}" if dumpable_n else "")
+                + (f" admin_sdk={admin_n}" if admin_n else "")
             )
             _append_log(status, level, msg)
             LOG.log(logging.INFO if job["ok"] else logging.ERROR, msg)
@@ -1081,6 +1136,33 @@ def run_batch(
             )
     except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to write firebase-access.json: %s", exc)
+    try:
+        sa_rows: list[dict[str, Any]] = []
+        for _, job in disk_jobs:
+            existing = job.get("admin_sdk") or []
+            if existing:
+                sa_rows.extend(existing)
+            else:
+                sa_rows.extend(detect_admin_sdk(job))
+        if sa_rows:
+            merged_sa = merge_admin_sdk(sa_rows)
+            status["admin_sdk"] = merged_sa
+            status["counts"]["admin_sdk"] = sum(
+                1 for r in merged_sa if r.get("severity") in ("critical", "high")
+            )
+            (output_dir / "admin-sdk-access.json").write_text(
+                json.dumps({
+                    "ok": True,
+                    "total": len(merged_sa),
+                    "critical_count": sum(1 for r in merged_sa if r.get("severity") == "critical"),
+                    "high_count": sum(1 for r in merged_sa if r.get("severity") == "high"),
+                    "results": merged_sa,
+                    "updated_at": _utc_now(),
+                }, indent=2),
+                encoding="utf-8",
+            )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("Failed to write admin-sdk-access.json: %s", exc)
     (output_dir / "results.txt").write_text(agg["text"], encoding="utf-8")
     (output_dir / "priority-results.txt").write_text(agg.get("priority_text") or "", encoding="utf-8")
     (output_dir / "other-results.txt").write_text(agg.get("other_text") or "", encoding="utf-8")
