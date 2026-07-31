@@ -861,6 +861,12 @@ const DashboardPage: React.FC = () => {
                   APKMirror is Cloudflare-protected and often fails from servers — prefer Aptoide or APKPure.
                 </Text>
               ) : null}
+              {downloadSource === 'apkpure' ? (
+                <Text type="secondary">
+                  APKPure&apos;s site/CDN is Cloudflare-blocked from this server. Downloads auto-fall back to
+                  Aptoide URLs for the same packages so large batches (e.g. 2000) still complete.
+                </Text>
+              ) : null}
               <Button
                 danger
                 block

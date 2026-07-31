@@ -865,9 +865,10 @@ def start_download(
     source_n = _normalize_download_source(
         source if source is not None else load_config().get("download_source")
     )
-    # APKPure rate-limits hard — 32 parallel workers → mass 403 and "download failed".
+    # APKPure CDN is CF-blocked; downloader falls back to Aptoide URLs. Keep workers
+    # moderate so Aptoide is not rate-limited during large (2k) batches.
     if source_n == "apkpure":
-        workers_n = min(workers_n, 8)
+        workers_n = min(workers_n, 12)
     cfg = save_config({
         "download_count": count,
         "download_workers": workers_n,

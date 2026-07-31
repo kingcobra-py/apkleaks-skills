@@ -47,6 +47,8 @@ APKPURE_DL = "https://d.apkpure.net/b/APK/{package}?version=latest"
 DEFAULT_MAX_BYTES = 80 * 1024 * 1024
 MANIFEST_NAME = "download-manifest.json"
 LEGACY_MANIFEST_NAME = "fdroid-manifest.json"
+# None = not probed yet; False = use Aptoide fallback for apkpure source.
+_APKPURE_CDN_OK: bool | None = None
 
 
 def _http_get(url: str, timeout: int = 120, headers: dict[str, str] | None = None) -> bytes:
@@ -191,18 +193,38 @@ def discover_packages(
     count: int,
     exclude_packages: set[str],
     seed: int | None = None,
-    pages: int = 8,
+    pages: int | None = None,
     page_size: int = 50,
 ) -> list[dict[str, Any]]:
-    """Pick random Aptoide store pages and collect unique package candidates."""
+    """Pick random Aptoide store pages and collect unique package candidates.
+
+    Page budget scales with ``count`` so requests like 2000 apps actually fill.
+    """
     rng = random.Random(seed)
     total = aptoide_total_apps()
     # Leave room near the end of the catalog.
     max_offset = max(0, total - page_size)
+    target = max(1, int(count))
+    # Need extras because many catalog hits are already excluded / oversized.
+    want = max(target * 3, target + 50)
+    if pages is None:
+        # ~50 apps/page; allow many random pages for large batches.
+        pages = max(24, (want // max(1, page_size)) + 16)
+    pages = max(1, int(pages))
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set(exclude_packages)
     attempts = 0
-    while len(candidates) < count * 3 and attempts < max(pages, 1):
+    empty_streak = 0
+    LOG.info(
+        "Discovering up to %s candidates (need %s) across ≤%s Aptoide pages "
+        "(catalog total≈%s, excluded=%s)",
+        want,
+        target,
+        pages,
+        total,
+        len(exclude_packages),
+    )
+    while len(candidates) < want and attempts < pages:
         attempts += 1
         offset = rng.randint(0, max_offset) if max_offset else 0
         # Align roughly to page_size to reduce overlap.
@@ -211,7 +233,11 @@ def discover_packages(
             apps = aptoide_list_page(offset, limit=page_size)
         except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             LOG.warning("Aptoide list failed offset=%s: %s", offset, exc)
+            empty_streak += 1
+            if empty_streak >= 12:
+                break
             continue
+        before = len(candidates)
         rng.shuffle(apps)
         for app in apps:
             pkg = app.get("package") or app.get("packageName")
@@ -233,10 +259,20 @@ def discover_packages(
                 "path": (file_meta or {}).get("path") or "",
             })
             seen.add(pkg)
-            if len(candidates) >= count * 3:
+            if len(candidates) >= want:
                 break
+        if len(candidates) == before:
+            empty_streak += 1
+            if empty_streak >= 16:
+                LOG.warning("Discovery stopping early — catalog pages exhausted of new packages")
+                break
+        else:
+            empty_streak = 0
+        if attempts % 25 == 0:
+            LOG.info("Discovery progress: %s/%s candidates (%s pages)", len(candidates), want, attempts)
     rng.shuffle(candidates)
-    return candidates[: max(1, count) * 2]
+    LOG.info("Discovered %s package candidates from %s page fetches", len(candidates), attempts)
+    return candidates[: max(target * 2, target)]
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +306,60 @@ def _resolve_aptoide_download(meta: dict[str, Any]) -> dict[str, Any]:
     return {**meta, "apkName": apk_name, "url": path}
 
 
+def _apkpure_cdn_alive() -> bool:
+    """Cheap probe — APKPure.com is Cloudflare-blocked from many VPS IPs."""
+    url = APKPURE_DL.format(package="com.whatsapp")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Referer": "https://apkpure.com/",
+        "Origin": "https://apkpure.com",
+    }
+    try:
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=15) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            chunk = resp.read(64)
+            final = resp.geturl() if hasattr(resp, "geturl") else url
+            # Real APK starts with ZIP magic PK; CDN currently bounces to HTML homepage.
+            if chunk[:2] != b"PK":
+                return False
+            if "html" in ctype:
+                return False
+            if final.rstrip("/").endswith("apkpure.com"):
+                return False
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _resolve_apkpure_download(meta: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a download URL for the apkpure source.
+
+    APKPure's site/CDN is Cloudflare-protected and currently returns HTML/403 from
+    typical server IPs. Package discovery already uses the Aptoide catalog, so when
+    the APKPure CDN is dead we fall back to the Aptoide file URL (same apps, working
+    bytes) instead of failing the whole 2k batch.
+    """
     pkg = meta["packageName"]
+    # One probe per process; flip to fallback after the first CDN failure.
+    global _APKPURE_CDN_OK
+    if _APKPURE_CDN_OK is None:
+        _APKPURE_CDN_OK = _apkpure_cdn_alive()
+        if not _APKPURE_CDN_OK:
+            LOG.warning(
+                "APKPure CDN/site blocked or returning HTML from this host — "
+                "falling back to Aptoide download URLs for APK bytes"
+            )
+
+    if not _APKPURE_CDN_OK:
+        resolved = _resolve_aptoide_download(meta)
+        return {**resolved, "download_via": "aptoide_fallback", "requested_source": "apkpure"}
+
     vercode = meta.get("versionCode") or 0
-    # Prefer versionCode from Aptoide discovery for stable filenames / dedup.
     if not vercode:
         try:
             detail = aptoide_get_meta(pkg)
@@ -290,6 +376,8 @@ def _resolve_apkpure_download(meta: dict[str, Any]) -> dict[str, Any]:
         "apkName": apk_name,
         "versionCode": vercode,
         "url": APKPURE_DL.format(package=pkg),
+        "download_via": "apkpure_cdn",
+        "requested_source": "apkpure",
     }
 
 
@@ -403,13 +491,34 @@ def _run_store_source(
     LOG.info("Downloading %s APK(s) from %s with %s worker(s)", len(selected), source, workers_n)
 
     def _one(meta: dict[str, Any]) -> dict[str, Any]:
+        global _APKPURE_CDN_OK
         try:
             resolved = resolve(meta)
             target = out_dir / resolved["apkName"]
             if target.exists() and not overwrite:
                 return {**resolved, "ok": True, "path": str(target), "skipped_duplicate": True}
-            path = _http_download(resolved["url"], target)
-            return {**resolved, "ok": True, "path": str(path), "skipped_duplicate": False}
+            try:
+                path = _http_download(resolved["url"], target)
+                return {**resolved, "ok": True, "path": str(path), "skipped_duplicate": False}
+            except (HTTPError, URLError, OSError, TimeoutError) as exc:
+                # Mid-batch CDN death → switch remaining apkpure jobs to Aptoide URLs.
+                if source == "apkpure" and resolved.get("download_via") != "aptoide_fallback":
+                    LOG.warning(
+                        "APKPure CDN failed for %s (%s) — switching to Aptoide fallback",
+                        meta.get("packageName"),
+                        exc,
+                    )
+                    _APKPURE_CDN_OK = False
+                    resolved = _resolve_aptoide_download(meta)
+                    resolved = {
+                        **resolved,
+                        "download_via": "aptoide_fallback",
+                        "requested_source": "apkpure",
+                    }
+                    target = out_dir / resolved["apkName"]
+                    path = _http_download(resolved["url"], target)
+                    return {**resolved, "ok": True, "path": str(path), "skipped_duplicate": False}
+                raise
         except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             LOG.error("Failed %s: %s", meta.get("packageName"), exc)
             return {**meta, "ok": False, "error": str(exc)}
