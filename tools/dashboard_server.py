@@ -39,6 +39,8 @@ _DB_URLS_PROC: subprocess.Popen | None = None
 _PREV_CPU: tuple[int, int] | None = None
 _RESULTS_CACHE: dict = {"key": None, "agg": None, "built_at": 0.0}
 _SYSTEM_CACHE: dict = {"built_at": 0.0, "data": None}
+_STATUS_CACHE: dict = {"built_at": 0.0, "data": None}
+_STATUS_CACHE_LOCK = threading.Lock()
 _LOOP_STOP = threading.Event()
 _LOOP_THREAD: threading.Thread | None = None
 _META_SKIP = {
@@ -51,6 +53,13 @@ _META_SKIP = {
     "admin-sdk-access.json",
     "db-urls.json",
 }
+
+# Polling endpoints must stay small — the UI aborts at a few seconds.
+_API_OTHER_LINES_CAP = 120
+_API_OPEN_CAP = 25
+_API_HIT_CAP = 25
+_API_LOG_CAP = 20
+_API_JOBS_CAP = 15
 
 
 DEMO_STATUS = {
@@ -193,6 +202,102 @@ def _read_cpu_times() -> tuple[int, int]:
     return idle, total
 
 
+def _cap_list(items: list | None, limit: int) -> list:
+    if not items:
+        return []
+    return list(items)[: max(0, limit)]
+
+
+def summarize_firebase(data: dict) -> dict:
+    """Compact Firebase payload for dashboard polls (full list via /api/firebase)."""
+    open_rows = data.get("open") or []
+    if not open_rows and data.get("results"):
+        open_rows = [r for r in data["results"] if isinstance(r, dict) and r.get("dumpable")]
+    return {
+        "ok": data.get("ok", True),
+        "probed": int(data.get("probed") or 0),
+        "dumpable_count": int(data.get("dumpable_count") or len(open_rows) or 0),
+        "open": _cap_list(open_rows, _API_OPEN_CAP),
+        "denied_count": len(data.get("denied") or []),
+        "deactivated_count": len(data.get("deactivated") or []),
+        "results": _cap_list(open_rows, _API_OPEN_CAP),
+        "state": data.get("state") or "idle",
+        "message": data.get("message") or "",
+        "running": bool(data.get("running")),
+        "updated_at": data.get("updated_at"),
+        "truncated": True,
+    }
+
+
+def summarize_admin_sdk(data: dict) -> dict:
+    results = [r for r in (data.get("results") or []) if isinstance(r, dict)]
+    critical = data.get("critical") or [r for r in results if r.get("severity") == "critical"]
+    high = data.get("high") or [r for r in results if r.get("severity") == "high"]
+    return {
+        "ok": data.get("ok", True),
+        "total": int(data.get("total") or len(results) or 0),
+        "critical_count": int(data.get("critical_count") or len(critical) or 0),
+        "high_count": int(data.get("high_count") or len(high) or 0),
+        "critical": _cap_list(critical, _API_HIT_CAP),
+        "high": _cap_list(high, _API_HIT_CAP),
+        # UI falls back to results when critical/high missing — keep only high-signal rows.
+        "results": _cap_list(list(critical) + list(high), _API_HIT_CAP),
+        "state": data.get("state") or "idle",
+        "message": data.get("message") or "",
+        "running": bool(data.get("running")),
+        "updated_at": data.get("updated_at"),
+        "truncated": True,
+    }
+
+
+def summarize_db_urls(data: dict) -> dict:
+    results = [r for r in (data.get("results") or []) if isinstance(r, dict)]
+    critical = data.get("critical") or [r for r in results if r.get("severity") == "critical"]
+    high = data.get("high") or [r for r in results if r.get("severity") == "high"]
+    return {
+        "ok": data.get("ok", True),
+        "total": int(data.get("total") or len(results) or 0),
+        "critical_count": int(data.get("critical_count") or len(critical) or 0),
+        "high_count": int(data.get("high_count") or len(high) or 0),
+        "with_credentials": int(
+            data.get("with_credentials")
+            or sum(1 for r in results if r.get("has_credentials"))
+            or 0
+        ),
+        "by_kind": data.get("by_kind") or {},
+        "critical": _cap_list(critical, _API_HIT_CAP),
+        "high": _cap_list(high, _API_HIT_CAP),
+        "results": _cap_list(list(critical) + list(high), _API_HIT_CAP),
+        "state": data.get("state") or "idle",
+        "message": data.get("message") or "",
+        "running": bool(data.get("running")),
+        "updated_at": data.get("updated_at"),
+        "truncated": True,
+    }
+
+
+def _batch_scan_alive() -> bool:
+    """True if a batch_scan parent/worker is running (ignore the pgrep command itself)."""
+    with _STATE_LOCK:
+        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
+            return True
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-af", "tools/batch_scan.py"],
+            text=True,
+            timeout=2,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    for line in out.splitlines():
+        # Skip the pgrep helper and pure shell wrappers.
+        if "pgrep" in line or "bash -c" in line:
+            continue
+        if "tools/batch_scan.py" in line:
+            return True
+    return False
+
+
 def system_stats(force: bool = False) -> dict:
     global _PREV_CPU
     now = time.time()
@@ -234,18 +339,8 @@ def system_stats(force: bool = False) -> dict:
 
     with _STATE_LOCK:
         download_running = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
-        scan_running = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
         loop_running = _LOOP_THREAD is not None and _LOOP_THREAD.is_alive() and not _LOOP_STOP.is_set()
-    if not scan_running:
-        try:
-            out = subprocess.check_output(
-                ["pgrep", "-f", "tools/batch_scan.py"],
-                text=True,
-                timeout=2,
-            ).strip()
-            scan_running = bool(out)
-        except Exception:  # noqa: BLE001
-            scan_running = False
+    scan_running = _batch_scan_alive()
 
     data = {
         "ok": True,
@@ -264,14 +359,38 @@ def system_stats(force: bool = False) -> dict:
         "scan_running": scan_running,
         "loop_running": loop_running,
         "loop": load_loop_status(),
-        "firebase": load_firebase_access(),
-        "admin_sdk": load_admin_sdk_access(),
-        "db_urls": load_db_urls(),
+        "firebase": summarize_firebase(load_firebase_access()),
+        "admin_sdk": summarize_admin_sdk(load_admin_sdk_access()),
+        "db_urls": summarize_db_urls(load_db_urls()),
         "config": load_config(),
+        "download": _load_download_status_brief(),
     }
     _SYSTEM_CACHE["data"] = data
     _SYSTEM_CACHE["built_at"] = now
     return data
+
+
+def _load_download_status_brief() -> dict:
+    default = {"ok": True, "state": "idle"}
+    if DOWNLOAD_STATUS_PATH.is_file():
+        try:
+            data = json.loads(DOWNLOAD_STATUS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {
+                    "ok": data.get("ok", True),
+                    "state": data.get("state") or "idle",
+                    "source": data.get("source"),
+                    "requested": data.get("requested"),
+                    "exit_code": data.get("exit_code"),
+                    "finished_at": data.get("finished_at"),
+                    "apk_count": data.get("apk_count"),
+                    "message": data.get("message"),
+                }
+        except json.JSONDecodeError:
+            pass
+    with _STATE_LOCK:
+        running = _DOWNLOAD_PROC is not None and _DOWNLOAD_PROC.poll() is None
+    return {"ok": True, "state": "running" if running else "idle"}
 
 
 def _write_download_status(payload: dict) -> None:
@@ -642,14 +761,7 @@ def load_loop_status() -> dict:
 
 
 def _scan_process_alive() -> bool:
-    with _STATE_LOCK:
-        if _SCAN_PROC is not None and _SCAN_PROC.poll() is None:
-            return True
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "tools/batch_scan.py"], text=True).strip()
-        return bool(out)
-    except Exception:  # noqa: BLE001
-        return False
+    return _batch_scan_alive()
 
 
 def _download_process_alive() -> bool:
@@ -753,6 +865,9 @@ def start_download(
     source_n = _normalize_download_source(
         source if source is not None else load_config().get("download_source")
     )
+    # APKPure rate-limits hard — 32 parallel workers → mass 403 and "download failed".
+    if source_n == "apkpure":
+        workers_n = min(workers_n, 8)
     cfg = save_config({
         "download_count": count,
         "download_workers": workers_n,
@@ -801,6 +916,13 @@ def start_download(
 
     def _watch() -> None:
         code = proc.wait()
+        apk_n = len(list(APKS_DIR.glob("*.apk"))) if APKS_DIR.is_dir() else 0
+        msg = None
+        if code != 0:
+            msg = (
+                f"Download from {source_n} failed (exit {code}). "
+                "APKPure often returns 403 — try Aptoide or F-Droid, and keep workers ≤ 8."
+            )
         _write_download_status({
             "ok": code == 0,
             "state": "completed" if code == 0 else "failed",
@@ -809,7 +931,8 @@ def start_download(
             "source": source_n,
             "exit_code": code,
             "finished_at": _utc_now(),
-            "apk_count": len(list(APKS_DIR.glob("*.apk"))) if APKS_DIR.is_dir() else 0,
+            "apk_count": apk_n,
+            "message": msg,
         })
 
     threading.Thread(target=_watch, daemon=True).start()
@@ -1280,52 +1403,47 @@ def load_status(status_path: Path) -> dict:
             data = json.loads(status_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 # Detect dead scanners: status says running but process is gone.
-                with _STATE_LOCK:
-                    alive = _SCAN_PROC is not None and _SCAN_PROC.poll() is None
-                if data.get("state") == "running" and not alive:
-                    try:
-                        out = subprocess.check_output(
-                            ["pgrep", "-f", "tools/batch_scan.py"],
-                            text=True,
-                            timeout=2,
-                        ).strip()
-                        alive = bool(out)
-                    except Exception:  # noqa: BLE001
-                        alive = False
+                alive = _batch_scan_alive()
                 if data.get("state") == "running" and not alive:
                     data["state"] = "idle"
                     data["active"] = {}
                     data["current"] = []
                     data["scan_dead"] = True
+                    # Persist so the UI/file don't keep showing ghost "scanning" apps.
+                    try:
+                        disk = json.loads(status_path.read_text(encoding="utf-8"))
+                        if isinstance(disk, dict) and disk.get("state") == "running":
+                            disk["state"] = "idle"
+                            disk["active"] = {}
+                            disk["current"] = []
+                            disk["updated_at"] = _utc_now()
+                            tmp = status_path.with_suffix(".tmp")
+                            tmp.write_text(json.dumps(disk, indent=2), encoding="utf-8")
+                            tmp.replace(status_path)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-                # Keep /api/status fast: do NOT re-read every per-APK JSON here.
-                # Full merge happens in collect_results() with a cache.
-                data.setdefault("priority_lines", [])
-                data.setdefault("other_lines", [])
-                data.setdefault("raw_lines", list(data.get("priority_lines") or []) + list(data.get("other_lines") or []))
-                data.setdefault("aws_pairs", [])
-                fb = load_firebase_access()
-                # Prefer live probe file; fall back to whatever status already has.
-                if fb.get("results") or fb.get("probed"):
-                    data["firebase_access"] = fb.get("results") or []
-                    data["firebase"] = fb
-                else:
-                    data.setdefault("firebase_access", [])
-                    data["firebase"] = fb
-                sa = load_admin_sdk_access()
-                if sa.get("results") or sa.get("total"):
-                    data["admin_sdk"] = sa.get("results") or []
-                    data["admin_sdk_status"] = sa
-                else:
-                    data.setdefault("admin_sdk", [])
-                    data["admin_sdk_status"] = sa
-                dbu = load_db_urls()
-                if dbu.get("results") or dbu.get("total"):
-                    data["db_urls"] = dbu.get("results") or []
-                    data["db_urls_status"] = dbu
-                else:
-                    data.setdefault("db_urls", [])
-                    data["db_urls_status"] = dbu
+                # Keep /api/status fast: truncate huge arrays — full lists via dedicated endpoints.
+                priority = list(data.get("priority_lines") or [])
+                other = list(data.get("other_lines") or [])
+                data["priority_lines"] = priority
+                data["other_lines"] = other[:_API_OTHER_LINES_CAP]
+                data["other_lines_total"] = len(other)
+                data["raw_lines"] = priority + data["other_lines"]
+                data["aws_pairs"] = list(data.get("aws_pairs") or [])[:50]
+                data["logs"] = list(data.get("logs") or [])[-_API_LOG_CAP:]
+                data["jobs"] = list(data.get("jobs") or [])[-_API_JOBS_CAP:]
+                data["queue_preview"] = list(data.get("queue_preview") or [])[:30]
+
+                fb = summarize_firebase(load_firebase_access())
+                sa = summarize_admin_sdk(load_admin_sdk_access())
+                dbu = summarize_db_urls(load_db_urls())
+                data["firebase"] = fb
+                data["firebase_access"] = list(fb.get("open") or [])
+                data["admin_sdk_status"] = sa
+                data["admin_sdk"] = list(sa.get("results") or [])
+                data["db_urls_status"] = dbu
+                data["db_urls"] = list(dbu.get("results") or [])
                 data["counts"] = data.get("counts") or {}
                 data["counts"].setdefault(
                     "firebase_dumpable",
@@ -1389,16 +1507,24 @@ class StatusHandler(BaseHTTPRequestHandler):
     website_dist: Path = ROOT / "website" / "dist"
 
     def _send(self, code: int, body: bytes, content_type: str = "application/json") -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Client aborted (often UI timeout on a previously-huge payload).
+            return
 
     def _json(self, payload: dict, code: int = 200) -> None:
-        self._send(code, json.dumps(payload).encode("utf-8"))
+        self._send(code, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: A003
+        # Silence noisy access logs; real errors still go to stderr via log_error.
+        return
 
     def _read_json_body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -1463,11 +1589,33 @@ class StatusHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path in ("/api/status", "/api/status.json"):
+            now = time.time()
+            with _STATUS_CACHE_LOCK:
+                cached = _STATUS_CACHE.get("data")
+                if cached is not None and (now - float(_STATUS_CACHE.get("built_at") or 0)) < 1.0:
+                    self._json(cached)
+                    return
             data = load_status(self.status_path)
             sys = system_stats()
-            data["system"] = sys
+            # Keep system block tiny — firebase/admin/db already on the status root.
+            data["system"] = {
+                "ok": True,
+                "cpu_percent": sys.get("cpu_percent"),
+                "memory": sys.get("memory"),
+                "loadavg": sys.get("loadavg"),
+                "apk_count": sys.get("apk_count"),
+                "download_running": sys.get("download_running"),
+                "scan_running": sys.get("scan_running"),
+                "loop_running": sys.get("loop_running"),
+                "loop": sys.get("loop"),
+                "config": sys.get("config"),
+                "download": sys.get("download"),
+            }
             data["config"] = sys.get("config") or load_config()
             data["loop"] = sys.get("loop") or load_loop_status()
+            with _STATUS_CACHE_LOCK:
+                _STATUS_CACHE["data"] = data
+                _STATUS_CACHE["built_at"] = time.time()
             self._json(data)
             return
 
@@ -1489,7 +1637,21 @@ class StatusHandler(BaseHTTPRequestHandler):
 
         if path in ("/api/results", "/api/results.json"):
             # Avoid rewriting status.json on every poll — cache handles speed.
-            self._json(collect_results(self.status_path, persist=False))
+            # Omit giant text blobs; UI only needs line arrays.
+            agg = collect_results(self.status_path, persist=False)
+            other = list(agg.get("other_lines") or [])
+            self._json({
+                "ok": True,
+                "total": int(agg.get("total") or len(agg.get("lines") or []) or 0),
+                "priority_total": int(
+                    agg.get("priority_total") or len(agg.get("priority_lines") or []) or 0
+                ),
+                "other_total": int(agg.get("other_total") or len(other) or 0),
+                "priority_lines": list(agg.get("priority_lines") or []),
+                "other_lines": other[:_API_OTHER_LINES_CAP],
+                "aws_pairs": list(agg.get("aws_pairs") or [])[:50],
+                "truncated": len(other) > _API_OTHER_LINES_CAP,
+            })
             return
 
         if path in ("/api/results.txt", "/api/export.txt"):
@@ -1731,7 +1893,11 @@ def main() -> int:
     # Resume auto-loop if it was left enabled across a dashboard restart.
     if load_config().get("loop_enabled"):
         start_loop()
-    server = ThreadingHTTPServer((args.host, args.port), StatusHandler)
+    class _DashboardServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        request_queue_size = 128
+
+    server = _DashboardServer((args.host, args.port), StatusHandler)
     print(f"Dashboard API listening on http://{args.host}:{args.port}")
     print(f"Status file: {StatusHandler.status_path}")
     print("GET /api/status /api/system /api/results /api/results.txt /api/loop")

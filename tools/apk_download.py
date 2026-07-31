@@ -71,10 +71,21 @@ def _http_download(
     target: Path,
     timeout: int = 180,
     max_bytes: int | None = DEFAULT_MAX_BYTES,
+    headers: dict[str, str] | None = None,
 ) -> Path:
     """Stream download to target (.part then rename). Rejects non-APK / oversized."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    h = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.android.package-archive,application/octet-stream,*/*",
+    }
+    if headers:
+        h.update(headers)
+    # APKPure CDN often 403s bare requests without a site referer.
+    if "apkpure" in url.lower():
+        h.setdefault("Referer", "https://apkpure.com/")
+        h.setdefault("Origin", "https://apkpure.com")
+    req = Request(url, headers=h)
     with urlopen(req, timeout=timeout) as resp:
         ctype = (resp.headers.get("Content-Type") or "").lower()
         clen = resp.headers.get("Content-Length")

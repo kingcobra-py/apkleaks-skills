@@ -300,7 +300,7 @@ const monoBoxStyle: React.CSSProperties = {
 
 const apiBaseCandidates = [''];
 
-async function apiFetch(path: string, init?: RequestInit, timeoutMs = 4000): Promise<Response | null> {
+async function apiFetch(path: string, init?: RequestInit, timeoutMs = 12000): Promise<Response | null> {
   for (const base of apiBaseCandidates) {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -372,7 +372,7 @@ const DashboardPage: React.FC = () => {
 
   const refresh = useCallback(async (opts?: { results?: boolean }) => {
     const wantResults = opts?.results !== false;
-    const res = await apiFetch('/api/status', undefined, 3500);
+    const res = await apiFetch('/api/status', undefined, 15000);
     if (!res || !res.ok) {
       // Never flash demo secrets over a live session if the API blips.
       if (!sawLiveRef.current) applyDemo();
@@ -394,7 +394,7 @@ const DashboardPage: React.FC = () => {
     let nextPriority = Array.isArray(data.priority_lines) ? data.priority_lines : null;
     let nextOther = Array.isArray(data.other_lines) ? data.other_lines : null;
     if (wantResults) {
-      const resultsRes = await apiFetch('/api/results', undefined, 6000);
+      const resultsRes = await apiFetch('/api/results', undefined, 20000);
       if (resultsRes?.ok) {
         const agg = await resultsRes.json();
         if (Array.isArray(agg?.priority_lines)) nextPriority = agg.priority_lines;
@@ -471,15 +471,19 @@ const DashboardPage: React.FC = () => {
   const onDownload = async () => {
     setBusyDownload(true);
     try {
+      const workers =
+        downloadSource === 'apkpure'
+          ? Math.min(8, Math.max(1, downloadWorkers || 4))
+          : Math.min(32, Math.max(1, downloadWorkers || 10));
       const res = await apiFetch('/api/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           count: downloadCount,
-          workers: downloadWorkers,
+          workers,
           source: downloadSource,
         }),
-      });
+      }, 15000);
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
         message.error(data?.error || 'Download failed to start');
@@ -545,16 +549,20 @@ const DashboardPage: React.FC = () => {
   const onStartLoop = async () => {
     setBusyLoop(true);
     try {
+      const dlWorkers =
+        downloadSource === 'apkpure'
+          ? Math.min(8, Math.max(1, loopDownloadWorkers || 4))
+          : Math.min(32, Math.max(1, loopDownloadWorkers || 10));
       const res = await apiFetch('/api/loop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           apps: loopApps,
           threads: Math.min(12, Math.max(1, loopThreads || 6)),
-          download_workers: loopDownloadWorkers,
+          download_workers: dlWorkers,
           source: downloadSource,
         }),
-      });
+      }, 15000);
       const data = res ? await res.json() : null;
       if (!res || !data?.ok) {
         message.error(data?.error || (res ? `Failed to start loop (HTTP ${res.status})` : 'Failed to start loop (no response)'));
