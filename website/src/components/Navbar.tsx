@@ -9,7 +9,7 @@ const { Header } = Layout;
 const Navbar: React.FC = () => {
   const { t, i18n } = useTranslation();
   const location = useLocation();
-  const selectedKey = location.pathname;
+  const selectedKey = location.pathname === '/' ? '/dashboard' : location.pathname;
 
   const toggleLang = () => {
     const next = i18n.language === 'zh' ? 'en' : 'zh';
@@ -18,17 +18,13 @@ const Navbar: React.FC = () => {
   };
 
   const items = [
-    { key: '/', label: <Link to="/">{t('nav.home')}</Link> },
-    { key: '/features', label: <Link to="/features">{t('nav.features')}</Link> },
-    { key: '/skills', label: <Link to="/skills">{t('nav.skills')}</Link> },
-    { key: '/install', label: <Link to="/install">{t('nav.install')}</Link> },
     { key: '/dashboard', label: <Link to="/dashboard">{t('nav.dashboard')}</Link> },
   ];
 
   return (
     <Header
       style={{
-        background: '#0f172a',
+        background: '#020617',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'space-between',
@@ -39,9 +35,9 @@ const Navbar: React.FC = () => {
         borderBottom: '1px solid #1e293b',
       }}
     >
-      <Link to="/" style={{ textDecoration: 'none' }}>
+      <Link to="/dashboard" style={{ textDecoration: 'none' }}>
         <span style={{ color: '#fff', fontSize: '1.2rem', fontWeight: 700 }}>APKLeaks</span>
-        <span style={{ color: '#818cf8', fontWeight: 400, marginLeft: 6 }}>for AI Agents</span>
+        <span style={{ color: '#22d3ee', fontWeight: 400, marginLeft: 6 }}>Dashboard</span>
       </Link>
       <Menu
         theme="dark"
@@ -56,11 +52,16 @@ const Navbar: React.FC = () => {
           size="small"
           icon={<GlobalOutlined />}
           onClick={toggleLang}
-          style={{ color: '#818cf8', fontSize: '0.9rem' }}
+          style={{ color: '#67e8f9', fontSize: '0.9rem' }}
         >
           {i18n.language === 'zh' ? 'EN' : '中文'}
         </Button>
-        <a href="https://github.com/android-security-engineer/apkleaks-skills" target="_blank" rel="noreferrer" style={{ color: '#94a3b8', fontSize: '1.2rem' }}>
+        <a
+          href="https://github.com/kingcobra-py/apkleaks-skills"
+          target="_blank"
+          rel="noreferrer"
+          style={{ color: '#94a3b8', fontSize: '1.2rem' }}
+        >
           <GithubOutlined />
         </a>
       </Space>
